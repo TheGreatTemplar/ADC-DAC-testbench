@@ -128,6 +128,21 @@ class TestTestbench(unittest.TestCase):
         self.assertFalse(self.window.hex_commands.isChecked())
         self.assertFalse(self.window.poll.isChecked())
 
+    def test_log_decodes_fragmented_and_combined_replies(self):
+        window = self.window
+        window.reset_protocol()
+        window.record("TX", b"&05\x05\r", 0)
+        self.assertIn("запрос версии ПО", window.log_view.toPlainText())
+        window.record("RX", b"!0501", 0)
+        self.assertIn("ожидается продолжение", window.log_view.toPlainText().splitlines()[-1])
+        window.record("RX", b"02\x08\r!0301\x04\r", 0)
+        line = window.log_view.toPlainText().splitlines()[-1]
+        self.assertIn("версия 1.2", line)
+        self.assertIn("тревога", line)
+        self.assertIn("CRC raw: OK", line)
+        window.record("RX", b"!050102FF\r", 0)
+        self.assertNotIn("версия 1.2", window.log_view.toPlainText().splitlines()[-1])
+
     def test_demo_fills_embedded_log_without_device_capture(self):
         window = self.window
         capture = io.StringIO()
@@ -145,6 +160,9 @@ class TestTestbench(unittest.TestCase):
                 self.assertEqual(len(lines), 2)
                 self.assertIn("[ДЕМО] TX", lines[0])
                 self.assertIn("[ДЕМО] RX", lines[1])
+                self.assertIn("запрос текущего уровня CH1", lines[0])
+                self.assertIn("ответ: уровень", lines[1])
+                self.assertIn("мВ", lines[1])
                 self.assertEqual(capture.getvalue(), "")
                 self.assertTrue(window.log_view.isVisible())
                 self.assertIs(window.log_view.window(), window)

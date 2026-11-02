@@ -13,7 +13,7 @@ import numpy as np
 from qt_compat import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 from serial.tools import list_ports
-from protocol import ReplyParser, command_code, encode_request
+from protocol import ReplyParser, command_code, describe_reply, describe_request, encode_request
 from transport import SerialWorker
 
 CHANNEL_COLORS = ["#45d7d0", "#f4bd61", "#8fb6ff", "#e591c8",
@@ -39,6 +39,7 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.source = "demo"
         self.session_start = time.monotonic()
         self.reply_parser = ReplyParser({})
+        self.log_reply_parser = ReplyParser({})
         self.rng = np.random.default_rng()
         self.times = deque(maxlen=60000)
         self.values = [deque(maxlen=60000) for _ in range(CHANNEL_COUNT)]
@@ -290,6 +291,7 @@ class TestbenchWindow(QtWidgets.QMainWindow):
             return
         self.reply_parser = ReplyParser({command_code(number, self.hex_commands.isChecked()): length
                                          for number, length in [(3, 1), (5, 2), (25, 2)]})
+        self.log_reply_parser = ReplyParser(self.reply_parser.lengths)
         if self.log_file is not None:
             self.record("CONFIG", b"", time.monotonic())
 
@@ -393,14 +395,26 @@ class TestbenchWindow(QtWidgets.QMainWindow):
 
     def record(self, direction, data, stamp, simulated=False):
         utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        description = ""
         if direction in ("TX", "RX"):
+            hex_numbers = self.hex_commands.isChecked()
+            if direction == "TX":
+                description = describe_request(data, hex_numbers)
+            else:
+                parser = (ReplyParser({command_code(number, hex_numbers): length
+                                       for number, length in [(3, 1), (5, 2), (25, 2)]})
+                          if simulated else self.log_reply_parser)
+                replies = parser.feed(data)
+                description = " | ".join(describe_reply(reply, hex_numbers) for reply in replies)
+                if not description:
+                    description = "Фрагмент ответа; ожидается продолжение" if parser.buffer else "Формат ответа или CRC не распознаны"
             source = "[ДЕМО] " if simulated else "[ПРИБОР] "
-            self.log_view.appendPlainText(f"{utc} {source}{direction}  {data.hex(' ').upper()}")
+            self.log_view.appendPlainText(f"{utc} {source}{direction}  {data.hex(' ').upper()}  | {description}")
         if self.log_file is not None and not simulated:
             record = dict(utc=utc, monotonic_s=stamp, direction=direction, hex=data.hex(" ").upper(),
                           command_numbers="HEX" if self.hex_commands.isChecked() else "DEC",
                           tx_crc=self.crc_mode.currentData(), port=self.port.currentData(),
-                          baud=int(self.baud.currentText()), serial_format="8N1")
+                          baud=int(self.baud.currentText()), serial_format="8N1", description=description)
             try:
                 self.log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
                 self.log_file.flush()
