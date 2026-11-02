@@ -1,18 +1,20 @@
-"""Desktop prototype for the ADC/DAC testbench. Device protocol is pending."""
+"""ADC/DAC testbench with protocol capture and a read-only device channel."""
 
 import argparse
 import csv
+import json
 import sys
+import time
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
-try:
-    from PySide2 import QtCore, QtGui, QtWidgets
-except ImportError:
-    from PySide6 import QtCore, QtGui, QtWidgets
+from qt_compat import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 from serial.tools import list_ports
+from protocol import ReplyParser, command_code, encode_request
+from transport import SerialWorker
 
 CHANNEL_COLORS = ["#45d7d0", "#f4bd61", "#8fb6ff", "#e591c8",
                   "#a4d66f", "#ff927b", "#b6a0ef", "#d8e2ef"]
@@ -29,6 +31,13 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.sample_index = 0
         self.running = False
         self.paused = False
+        self.worker = None
+        self.device_ready = False
+        self.pending = None
+        self.log_file = None
+        self.source = "demo"
+        self.session_start = time.monotonic()
+        self.reply_parser = ReplyParser({})
         self.rng = np.random.default_rng()
         self.times = deque(maxlen=60000)
         self.values = [deque(maxlen=60000) for _ in range(CHANNEL_COUNT)]
@@ -42,12 +51,17 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.port_timer.setInterval(1500)
         self.port_timer.timeout.connect(self.refresh_ports)
         self.port_timer.start()
+        self.request_timer = QtCore.QTimer(self)
+        self.request_timer.setInterval(100)
+        self.request_timer.timeout.connect(self.check_requests)
+        self.request_timer.start()
         self.statusBar().showMessage("Готов к работе • Источник: демонстрационный сигнал")
 
     def build_menu(self):
         file_menu = self.menuBar().addMenu("Файл")
         self.export_action = file_menu.addAction("Сохранить буфер в CSV…", self.export_csv)
         self.export_action.setShortcut("Ctrl+S")
+        file_menu.addAction("Показать журнал обмена", self.show_log)
         file_menu.addSeparator()
         file_menu.addAction("Выход", self.close, "Alt+F4")
         view_menu = self.menuBar().addMenu("Вид")
@@ -75,11 +89,20 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         body.setSpacing(18)
         layout.addLayout(body, 1)
         sidebar = QtWidgets.QWidget()
-        sidebar.setFixedWidth(260)
+        sidebar.setMinimumWidth(260)
         side = QtWidgets.QVBoxLayout(sidebar)
         side.setContentsMargins(0, 0, 0, 0)
         side.setSpacing(14)
-        body.addWidget(sidebar)
+        self.sidebar_tabs = QtWidgets.QTabWidget()
+        self.sidebar_tabs.setFixedWidth(290)
+        port_page = QtWidgets.QWidget()
+        port_layout = QtWidgets.QVBoxLayout(port_page)
+        protocol_page = QtWidgets.QWidget()
+        protocol_layout = QtWidgets.QVBoxLayout(protocol_page)
+        self.sidebar_tabs.addTab(port_page, "Порт")
+        self.sidebar_tabs.addTab(protocol_page, "Протокол")
+        self.sidebar_tabs.addTab(sidebar, "Каналы")
+        body.addWidget(self.sidebar_tabs)
         connection = QtWidgets.QGroupBox("ПОДКЛЮЧЕНИЕ")
         form = QtWidgets.QFormLayout(connection)
         form.setSpacing(10)
@@ -91,7 +114,7 @@ class TestbenchWindow(QtWidgets.QMainWindow):
                             [1200, 1800, 2400, 4800, 9600, 14400, 19200, 28800,
                              38400, 57600, 76800, 115200, 128000, 153600, 230400,
                              250000, 256000, 460800, 500000, 576000, 921600, 1000000]])
-        self.baud.setCurrentText("115200")
+        self.baud.setCurrentText("9600")
         form.addRow("Скорость", self.baud)
         format_label = QtWidgets.QLabel("8 бит · без чётности · 1 стоп-бит")
         format_label.setObjectName("muted")
@@ -99,26 +122,54 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         refresh = QtWidgets.QPushButton("Обновить список портов")
         refresh.clicked.connect(self.refresh_ports)
         form.addRow(refresh)
-        connect = QtWidgets.QPushButton("Подключить прибор")
-        connect.setEnabled(False)
-        connect.setToolTip("Будет доступно после определения протокола прибора")
-        form.addRow(connect)
-        note = QtWidgets.QLabel("Протокол прибора пока не задан.\nСейчас доступен демонстрационный сигнал.")
+        self.connect_button = QtWidgets.QPushButton("Подключить прибор")
+        self.connect_button.clicked.connect(self.toggle_connection)
+        form.addRow(self.connect_button)
+        note = QtWidgets.QLabel("Список портов обновляется автоматически.\nПосле подключения запросы отправляются кнопками ниже.")
         note.setWordWrap(True)
         note.setObjectName("muted")
         form.addRow(note)
-        side.addWidget(connection)
+        port_layout.addWidget(connection)
+        port_layout.addStretch()
+        protocol_group = QtWidgets.QGroupBox("ПРОТОКОЛ / ПРОБНЫЙ ОБМЕН")
+        protocol_form = QtWidgets.QVBoxLayout(protocol_group)
+        self.hex_commands = QtWidgets.QCheckBox("Номера команд в HEX")
+        self.hex_commands.setToolTip("Снято: 25 → 0x19 (DEC). Установлено: 25 → 0x25 (HEX).")
+        self.hex_commands.toggled.connect(self.reset_protocol)
+        protocol_form.addWidget(self.hex_commands)
+        self.crc_mode = QtWidgets.QComboBox()
+        self.crc_mode.addItem("CRC запроса: 1 сырой байт", "raw")
+        self.crc_mode.addItem("CRC запроса: 2 символа HEX", "hex")
+        self.crc_mode.currentIndexChanged.connect(self.reset_protocol)
+        protocol_form.addWidget(self.crc_mode)
+        self.query_buttons = []
+        for text, command in [("Версия ПО · 5", 5), ("Состояние · 3", 3), ("Текущий уровень · 25", 25)]:
+            button = QtWidgets.QPushButton(text)
+            button.setEnabled(False)
+            button.clicked.connect(lambda checked=False, number=command: self.query(number))
+            protocol_form.addWidget(button)
+            self.query_buttons.append(button)
+        self.poll = QtWidgets.QCheckBox("Опрос уровня каждые 200 мс")
+        self.poll.setEnabled(False)
+        protocol_form.addWidget(self.poll)
+        log_button = QtWidgets.QPushButton("Журнал TX / RX (HEX)")
+        log_button.clicked.connect(self.show_log)
+        protocol_form.addWidget(log_button)
+        protocol_layout.addWidget(protocol_group)
+        protocol_layout.addStretch()
         channels = QtWidgets.QGroupBox("КАНАЛЫ АЦП")
         channel_layout = QtWidgets.QGridLayout(channels)
         self.channel_checks = []
         for index, color in enumerate(CHANNEL_COLORS):
             check = QtWidgets.QCheckBox(f"CH{index + 1}")
-            check.setChecked(True)
-            check.setStyleSheet(f"color:{color}; font-weight:600")
+            check.setChecked(index == 0)
+            check.setEnabled(index == 0)
+            check.setToolTip("Текущий уровень прибора" if index == 0 else "Резерв: не описан в протоколе")
+            check.setStyleSheet(f"QCheckBox {{ color:{color}; font-weight:600; }} QCheckBox:disabled {{ color:#65758a; }}")
             check.toggled.connect(self.update_plot)
             self.channel_checks.append(check)
             channel_layout.addWidget(check, index // 2, index % 2)
-        channel_layout.addWidget(QtWidgets.QLabel("Единицы: коды АЦП\nДемо: 12 бит, 0…4095"), 4, 0, 1, 2)
+        channel_layout.addWidget(QtWidgets.QLabel("CH1: уровень, код / мВ\nCH2–CH8: резерв"), 4, 0, 1, 2)
         side.addWidget(channels)
         acquisition = QtWidgets.QGroupBox("ОТОБРАЖЕНИЕ")
         acquisition_form = QtWidgets.QFormLayout(acquisition)
@@ -127,7 +178,7 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.window_seconds.setCurrentText("10")
         self.window_seconds.currentTextChanged.connect(self.update_plot)
         acquisition_form.addRow("Окно, с", self.window_seconds)
-        acquisition_form.addRow(QtWidgets.QLabel("Демо: 1 000 отсчётов/с на канал\nБуфер: последние 60 секунд"))
+        acquisition_form.addRow(QtWidgets.QLabel("Прибор: уровень по команде 25\nБуфер: последние 60 секунд"))
         side.addWidget(acquisition)
         dac_note = QtWidgets.QLabel("ЦАП\nУправление добавим после\nсогласования команд прибора.")
         dac_note.setObjectName("muted")
@@ -155,7 +206,7 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         main.addLayout(toolbar)
         pg.setConfigOptions(antialias=True)
         self.plot = pg.PlotWidget(background="#101b2b")
-        self.plot.setLabel("left", "Код АЦП")
+        self.plot.setLabel("left", "Уровень CH1, код")
         self.plot.setLabel("bottom", "Время", units="s")
         self.plot.showGrid(x=True, y=True, alpha=0.15)
         self.plot.addLegend(offset=(15, 10))
@@ -163,8 +214,10 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.plot.setXRange(0, 10, padding=0)
         self.plot.setClipToView(True)
         self.plot.setDownsampling(auto=True, mode="peak")
-        self.curves = [self.plot.plot(pen=pg.mkPen(color, width=1.5), name=f"CH{index + 1}")
+        self.curves = [self.plot.plot(pen=pg.mkPen(color, width=1.5), name="CH1" if index == 0 else None)
                        for index, color in enumerate(CHANNEL_COLORS)]
+        for curve in self.curves[1:]:
+            curve.setVisible(False)
         main.addWidget(self.plot, 1)
         hint = QtWidgets.QLabel("Колесо мыши — масштаб · перетаскивание — перемещение · правая кнопка — меню графика")
         hint.setObjectName("muted")
@@ -194,8 +247,231 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         save.clicked.connect(self.export_csv)
         footer.addWidget(save)
         main.addLayout(footer)
+        self.device_info = QtWidgets.QLabel("Прибор не подключён · 9600 8N1 · CH1 — средневыпрямленный уровень")
+        self.device_info.setWordWrap(True)
+        self.device_info.setObjectName("muted")
+        main.addWidget(self.device_info)
+        self.log_dialog = QtWidgets.QDialog(self)
+        self.log_dialog.setWindowTitle("Журнал обмена — исходные байты TX / RX")
+        self.log_dialog.resize(940, 500)
+        log_layout = QtWidgets.QVBoxLayout(self.log_dialog)
+        self.log_path = QtWidgets.QLabel("Файл журнала создаётся при подключении в папке captures.")
+        self.log_path.setWordWrap(True)
+        log_layout.addWidget(self.log_path)
+        self.log_view = QtWidgets.QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(500)
+        self.log_view.setStyleSheet("font-family:Consolas; font-size:12px")
+        log_layout.addWidget(self.log_view)
+
+    def show_log(self):
+        self.log_dialog.show()
+        self.log_dialog.raise_()
+
+    def reset_protocol(self, *_):
+        if not hasattr(self, "hex_commands") or not hasattr(self, "crc_mode"):
+            return
+        self.reply_parser = ReplyParser({command_code(number, self.hex_commands.isChecked()): length
+                                         for number, length in [(3, 1), (5, 2), (25, 2)]})
+        if self.log_file is not None:
+            self.record("CONFIG", b"", time.monotonic())
+
+    def set_request_controls(self):
+        idle = self.pending is None
+        for button in self.query_buttons:
+            button.setEnabled(self.device_ready and idle)
+        self.hex_commands.setEnabled(idle)
+        self.crc_mode.setEnabled(idle)
+        self.poll.setEnabled(self.device_ready)
+
+    def toggle_connection(self):
+        if self.worker is not None:
+            self.poll.setChecked(False)
+            self.device_ready = False
+            self.worker.requestInterruption()
+            self.connect_button.setEnabled(False)
+            self.device_info.setText("Отключение порта…")
+            self.set_request_controls()
+            return
+        port = self.port.currentData()
+        if not port:
+            QtWidgets.QMessageBox.information(self, "COM-порт", "Выберите доступный COM-порт.")
+            return
+        if self.running:
+            self.toggle_run()
+        directory = Path(__file__).resolve().parent / "captures"
+        filename = "exchange_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f") + ".jsonl"
+        try:
+            directory.mkdir(exist_ok=True)
+            capture_path = directory / filename
+            self.log_file = capture_path.open("w", encoding="utf-8")
+        except OSError:
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Куда записать обмен с прибором?", filename,
+                                                          "Журнал обмена (*.jsonl)")
+            if not path:
+                return
+            try:
+                capture_path = Path(path)
+                self.log_file = capture_path.open("w", encoding="utf-8")
+            except OSError as error:
+                QtWidgets.QMessageBox.warning(self, "Журнал обмена", str(error))
+                return
+        self.source = "device"
+        self.clear_data()
+        self.reset_protocol()
+        self.log_path.setText(str(capture_path))
+        self.badge.setText("●  ПРИБОР · УРОВЕНЬ CH1")
+        self.plot.enableAutoRange(axis="y", enable=True)
+        self.worker = SerialWorker(port, int(self.baud.currentText()), self)
+        self.worker.opened.connect(self.device_opened)
+        self.worker.received.connect(self.receive_data)
+        self.worker.transmitted.connect(self.data_transmitted)
+        self.worker.failed.connect(self.device_failed)
+        self.worker.finished.connect(self.device_finished)
+        self.port.setEnabled(False)
+        self.baud.setEnabled(False)
+        self.start.setEnabled(False)
+        self.connect_button.setText("Отключить прибор")
+        self.device_info.setText(f"Открытие {port} · {self.baud.currentText()} 8N1…")
+        self.worker.start()
+
+    def device_opened(self):
+        if self.worker is None or self.worker.isInterruptionRequested():
+            return
+        self.device_ready = True
+        self.pending = None
+        self.last_poll = time.monotonic()
+        self.set_request_controls()
+        self.device_info.setText("Порт открыт. Нажмите «Версия ПО» для первого запроса. Обмен записывается в журнал.")
+        self.sidebar_tabs.setCurrentIndex(1)
+        self.update_status()
+
+    def device_failed(self, message):
+        self.device_ready = False
+        self.poll.setChecked(False)
+        self.device_info.setText("Ошибка COM-порта: " + message)
+        self.log_view.appendPlainText("ОШИБКА ПОРТА: " + message)
+        self.set_request_controls()
+
+    def device_finished(self):
+        worker = self.worker
+        self.worker = None
+        self.device_ready = False
+        self.pending = None
+        self.poll.setChecked(False)
+        self.set_request_controls()
+        self.port.setEnabled(True)
+        self.baud.setEnabled(True)
+        self.start.setEnabled(True)
+        self.connect_button.setEnabled(True)
+        self.connect_button.setText("Подключить прибор")
+        if self.log_file is not None:
+            self.record("CLOSE", b"", time.monotonic())
+            self.log_file.close()
+            self.log_file = None
+        self.log_view.appendPlainText("Порт закрыт. Журнал сохранён.")
+        if worker is not None:
+            worker.deleteLater()
+        self.update_status()
+
+    def record(self, direction, data, stamp):
+        utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        if direction in ("TX", "RX"):
+            self.log_view.appendPlainText(f"{utc} {direction}  {data.hex(' ').upper()}")
+        if self.log_file is not None:
+            record = dict(utc=utc, monotonic_s=stamp, direction=direction, hex=data.hex(" ").upper(),
+                          command_numbers="HEX" if self.hex_commands.isChecked() else "DEC",
+                          tx_crc=self.crc_mode.currentData(), port=self.port.currentData(),
+                          baud=int(self.baud.currentText()), serial_format="8N1")
+            try:
+                self.log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+                self.log_file.flush()
+            except OSError as error:
+                self.log_file.close()
+                self.log_file = None
+                self.poll.setChecked(False)
+                self.log_path.setText("ОШИБКА записи журнала: " + str(error))
+                self.device_info.setText("Запись обмена остановлена: " + str(error))
+
+    def query(self, number):
+        if not self.device_ready or self.pending is not None or number not in (3, 5, 25):
+            return
+        code = command_code(number, self.hex_commands.isChecked())
+        self.pending = dict(number=number, code=code, deadline=time.monotonic() + 1.0)
+        self.last_poll = time.monotonic()
+        self.set_request_controls()
+        self.worker.send(encode_request(code, self.crc_mode.currentData()))
+        self.device_info.setText(f"Ожидается ответ: команда {number}, байт 0x{code:02X}…")
+
+    def data_transmitted(self, data, stamp):
+        self.record("TX", data, stamp)
+        if self.pending is not None:
+            self.pending["deadline"] = stamp + 0.5
+
+    def check_requests(self):
+        now = time.monotonic()
+        if self.pending is not None and now >= self.pending["deadline"]:
+            code = self.pending["code"]
+            self.pending = None
+            self.poll.setChecked(False)
+            self.set_request_controls()
+            message = f"Нет корректного ответа на 0x{code:02X} за 500 мс. Проверьте журнал и вариант CRC / DEC / HEX."
+            self.device_info.setText(message)
+            self.log_view.appendPlainText(message)
+        if self.device_ready and self.poll.isChecked() and self.pending is None and now - self.last_poll >= 0.2:
+            self.query(25)
+
+    def receive_data(self, data, stamp):
+        self.record("RX", data, stamp)
+        previous = self.reply_parser.rejected
+        for reply in self.reply_parser.feed(data):
+            if self.pending is not None and reply.command == self.pending["code"]:
+                self.pending = None
+                self.set_request_controls()
+            if reply.device_error:
+                self.poll.setChecked(False)
+                self.device_info.setText(f"Прибор отклонил команду 0x{reply.command:02X}; CRC {reply.checksum_mode} верна.")
+                continue
+            if reply.command == command_code(5, self.hex_commands.isChecked()):
+                text = f"Версия ПО: {reply.data[0]}.{reply.data[1]}"
+            elif reply.command == command_code(3, self.hex_commands.isChecked()):
+                state = reply.data[0]
+                flags = [(1, "тревога"), (2, "неисправность"), (4, "обрыв кабеля"),
+                         (8, "отключен"), (32, "КЗ кабеля"), (128, "дистанционный контроль")]
+                text = f"Состояние: 0x{state:02X} · " + (", ".join(name for mask, name in flags if state & mask) or "норма")
+                if state & ~0xAF:
+                    text += " · неизвестные биты"
+            else:
+                value = int.from_bytes(reply.data, "little")
+                self.add_device_sample(value, stamp)
+                text = f"Уровень: {value} код · {value * 0.6105:.3f} мВ"
+            self.device_info.setText(text + f" · CRC {reply.checksum_mode}: OK")
+        if self.reply_parser.rejected != previous:
+            self.log_view.appendPlainText("Ответ не распознан или CRC не совпала. Исходные байты сохранены.")
+
+    def add_device_sample(self, value, stamp):
+        self.times.append(max(0.0, stamp - self.session_start))
+        self.values[0].append(value)
+        while self.times and self.times[0] < self.times[-1] - 60:
+            self.times.popleft()
+            self.values[0].popleft()
+        self.buffer_label.setText(f"Прибор · {len(self.times)} измерений · уровень по команде 25")
+        if not self.paused:
+            self.update_plot()
+
+    def closeEvent(self, event):
+        if self.worker is not None:
+            self.worker.requestInterruption()
+            if not self.worker.wait(1500):
+                self.device_info.setText("Ожидается завершение операции COM-порта. Повторите закрытие.")
+                event.ignore()
+                return
+            self.device_finished()
+        event.accept()
 
     def refresh_ports(self):
+        if self.worker is not None:
+            return
         if self.port.view().isVisible():
             return
         selected = self.port.currentData()
@@ -220,6 +496,12 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.port.blockSignals(False)
 
     def toggle_run(self):
+        if self.worker is not None:
+            return
+        if self.source != "demo":
+            self.source = "demo"
+            self.clear_data()
+            self.badge.setText("●  ДЕМО-РЕЖИМ")
         self.running = not self.running
         if self.running:
             self.timer.start()
@@ -229,6 +511,12 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.update_status()
 
     def update_status(self):
+        if self.source == "device":
+            message = "Прибор подключён" if self.device_ready else "Прибор отключён"
+            if self.paused:
+                message += " • Пауза графика, приём продолжается"
+            self.statusBar().showMessage(message)
+            return
         message = "Демо: приём идёт" if self.running else "Демо остановлено"
         if self.paused:
             message += " • График на паузе; буфер продолжает обновляться при работающем демо"
@@ -245,8 +533,7 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         count = self.rate * self.timer.interval() // 1000
         times = np.arange(self.sample_index, self.sample_index + count) / self.rate
         self.sample_index += count
-        signals = [2048 + index * 36 + (23 - index) * np.sin(2 * np.pi * (1.2 - index * 0.12) * times)
-                   + self.rng.normal(0, 5, count) for index in range(CHANNEL_COUNT)]
+        signals = [2048 + 23 * np.sin(2 * np.pi * 1.2 * times) + self.rng.normal(0, 5, count)]
         self.times.extend(times)
         for buffer, signal in zip(self.values, signals):
             buffer.extend(np.clip(np.rint(signal), 0, 4095).astype(int))
@@ -258,7 +545,7 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         if not hasattr(self, "curves"):
             return
         for curve, check in zip(self.curves, self.channel_checks):
-            curve.setVisible(check.isChecked())
+            curve.setVisible(check.isEnabled() and check.isChecked())
         if not self.times or self.paused:
             return
         times = np.asarray(self.times)
@@ -267,7 +554,8 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         left = right - seconds
         start = np.searchsorted(times, left)
         for curve, buffer in zip(self.curves, self.values):
-            curve.setData(times[start:], np.asarray(buffer)[start:])
+            if buffer:
+                curve.setData(times[start:], np.asarray(buffer)[start:])
         self.plot.setXRange(left, right, padding=0)
         values = np.asarray(self.values[0])[start:]
         if len(values):
@@ -286,6 +574,7 @@ class TestbenchWindow(QtWidgets.QMainWindow):
             buffer.clear()
             curve.setData([], [])
         self.sample_index = 0
+        self.session_start = time.monotonic()
         for label in self.stat_labels:
             label.setText("—")
         self.buffer_label.setText("Буфер пуст")
@@ -294,15 +583,15 @@ class TestbenchWindow(QtWidgets.QMainWindow):
     def write_csv(self, path):
         with Path(path).open("w", newline="", encoding="utf-8-sig") as stream:
             writer = csv.writer(stream, delimiter=";")
-            writer.writerow(["source", "time_s"] + [f"adc{index + 1}_code" for index in range(CHANNEL_COUNT)])
-            writer.writerows(("demo", f"{row[0]:.6f}", *row[1:])
-                             for row in zip(self.times, *self.values))
+            writer.writerow(["source", "time_s", "ch1_level_code", "ch1_level_mV"])
+            writer.writerows((self.source, f"{stamp:.6f}", value, f"{value * 0.6105:.4f}")
+                             for stamp, value in zip(self.times, self.values[0]))
 
     def export_csv(self):
         if not self.times:
-            QtWidgets.QMessageBox.information(self, "Сохранение", "Буфер пуст. Сначала запустите демо.")
+            QtWidgets.QMessageBox.information(self, "Сохранение", "Буфер пуст. Запустите демо или запросите уровень прибора.")
             return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Сохранить буфер", "adc_demo.csv", "CSV (*.csv)")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Сохранить буфер", f"adc_{self.source}.csv", "CSV (*.csv)")
         if path:
             try:
                 self.write_csv(path)
@@ -311,8 +600,9 @@ class TestbenchWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.warning(self, "Ошибка сохранения", str(error))
 
     def about(self):
-        QtWidgets.QMessageBox.about(self, "О программе", "ADC / DAC Testbench\nПрототип интерфейса 0.2\n\n"
-                                  "Восемь демонстрационных каналов АЦП.\nПодключение прибора и управление ЦАП — после определения протокола.\n"
+        QtWidgets.QMessageBox.about(self, "О программе", "ADC / DAC Testbench\nВерсия 0.3 — пробный обмен\n\n"
+                                  "CH1 — уровень сигнала (команда 25). CH2–CH8 — резерв.\n"
+                                  "Формат CRC и система счисления команд проверяются по журналу.\n"
                                   "Статистика CH1 рассчитана по видимому временному окну.\nСКО — отклонение от среднего значения.")
 
 
@@ -338,6 +628,10 @@ def main():
         QLabel { background:transparent; }
         QPushButton, QComboBox { background:#1e3048; border:1px solid #354862;
                                 border-radius:5px; padding:8px 10px; }
+        QComboBox { min-height:18px; }
+        QTabWidget::pane { border:1px solid #29394e; }
+        QTabBar::tab { background:#172437; padding:9px 12px; color:#91a3bb; }
+        QTabBar::tab:selected { background:#1e3048; color:#45d7d0; }
         QPushButton:hover { background:#2b4260; border-color:#5890b0; }
         QPushButton:checked { background:#395370; }
         QPushButton:disabled { color:#738197; background:#1a2637; border-color:#29364a; }

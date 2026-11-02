@@ -24,7 +24,7 @@ if ($LASTEXITCODE -ne 0)
 {
     throw 'Portable dependencies installation failed.'
 }
-Copy-Item -LiteralPath app.py, LICENSE, PORTABLE.txt, requirements-portable.txt -Destination portable -Force
+Copy-Item -LiteralPath app.py, qt_compat.py, protocol.py, transport.py, LICENSE, PORTABLE.txt, requirements-portable.txt -Destination portable -Force
 Copy-Item -LiteralPath portable-start.cmd -Destination portable\START.cmd -Force
 Compress-Archive -Path portable\* -DestinationPath ADC-DAC-testbench-portable.zip -Force
 Write-Output 'Ready: ADC-DAC-testbench-portable.zip'
