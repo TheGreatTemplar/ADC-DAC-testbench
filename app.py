@@ -87,7 +87,10 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.port.setMinimumWidth(130)
         form.addRow("COM-порт", self.port)
         self.baud = QtWidgets.QComboBox()
-        self.baud.addItems(["9600", "57600", "115200", "230400", "460800", "921600"])
+        self.baud.addItems([str(rate) for rate in
+                            [1200, 1800, 2400, 4800, 9600, 14400, 19200, 28800,
+                             38400, 57600, 76800, 115200, 128000, 153600, 230400,
+                             250000, 256000, 460800, 500000, 576000, 921600, 1000000]])
         self.baud.setCurrentText("115200")
         form.addRow("Скорость", self.baud)
         format_label = QtWidgets.QLabel("8 бит · без чётности · 1 стоп-бит")
