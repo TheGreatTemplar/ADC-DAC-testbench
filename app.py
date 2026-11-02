@@ -408,8 +408,11 @@ class TestbenchWindow(QtWidgets.QMainWindow):
                 description = " | ".join(describe_reply(reply, hex_numbers) for reply in replies)
                 if not description:
                     description = "Фрагмент ответа; ожидается продолжение" if parser.buffer else "Формат ответа или CRC не распознаны"
-            source = "[ДЕМО] " if simulated else "[ПРИБОР] "
-            self.log_view.appendPlainText(f"{utc} {source}{direction}  {data.hex(' ').upper()}  | {description}")
+            source = "[ДЕМО]" if simulated else "[ПРИБОР]"
+            hex_lines = [data[offset:offset + 16].hex(" ").upper() for offset in range(0, len(data), 16)] or [""]
+            for index, hex_text in enumerate(hex_lines):
+                details = description if index == 0 else "Продолжение байтов той же порции"
+                self.log_view.appendPlainText(f"{utc} {source:<8} {direction}  {hex_text:<47}  | {details}")
         if self.log_file is not None and not simulated:
             record = dict(utc=utc, monotonic_s=stamp, direction=direction, hex=data.hex(" ").upper(),
                           command_numbers="HEX" if self.hex_commands.isChecked() else "DEC",
@@ -662,7 +665,7 @@ def main():
         import os
 
         font_dir = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
-        for filename in ["segoeui.ttf", "segoeuib.ttf"]:
+        for filename in ["segoeui.ttf", "segoeuib.ttf", "consola.ttf"]:
             QtGui.QFontDatabase.addApplicationFont(str(font_dir / filename))
         app.setFont(QtGui.QFont("Segoe UI", 10))
     app.setStyle("Fusion")

@@ -158,8 +158,10 @@ class TestTestbench(unittest.TestCase):
                     window.tick()
                 lines = window.log_view.toPlainText().splitlines()
                 self.assertEqual(len(lines), 2)
-                self.assertIn("[ДЕМО] TX", lines[0])
-                self.assertIn("[ДЕМО] RX", lines[1])
+                self.assertIn("[ДЕМО]", lines[0])
+                self.assertIn(" TX ", lines[0])
+                self.assertIn("[ДЕМО]", lines[1])
+                self.assertIn(" RX ", lines[1])
                 self.assertIn("запрос текущего уровня CH1", lines[0])
                 self.assertIn("ответ: уровень", lines[1])
                 self.assertIn("мВ", lines[1])
@@ -171,7 +173,7 @@ class TestTestbench(unittest.TestCase):
             window.log_view.clear()
             for _ in range(5):
                 window.tick()
-            self.assertIn("[ДЕМО] RX", window.log_view.toPlainText())
+            self.assertIn(" RX ", window.log_view.toPlainText())
         finally:
             window.log_file = None
 
