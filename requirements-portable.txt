@@ -1,0 +1,6 @@
+# Windows 7 SP1 / 8 / 8.1 / 10, x86 and x64 (32-bit application).
+PySide2==5.15.2.1
+shiboken2==5.15.2.1
+pyqtgraph==0.13.3
+numpy==1.21.6
+pyserial==3.5

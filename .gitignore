@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+captures/
+preview.png
+portable/
+downloads/
+ADC-DAC-testbench-portable.zip
