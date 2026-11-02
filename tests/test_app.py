@@ -128,6 +128,35 @@ class TestTestbench(unittest.TestCase):
         self.assertFalse(self.window.hex_commands.isChecked())
         self.assertFalse(self.window.poll.isChecked())
 
+    def test_demo_fills_embedded_log_without_device_capture(self):
+        window = self.window
+        capture = io.StringIO()
+        window.log_file = capture
+        try:
+            for hex_numbers, mode in [(False, "raw"), (True, "hex")]:
+                window.hex_commands.setChecked(hex_numbers)
+                window.crc_mode.setCurrentIndex(window.crc_mode.findData(mode))
+                window.log_view.clear()
+                capture.seek(0)
+                capture.truncate()
+                for _ in range(5):
+                    window.tick()
+                lines = window.log_view.toPlainText().splitlines()
+                self.assertEqual(len(lines), 2)
+                self.assertIn("[ДЕМО] TX", lines[0])
+                self.assertIn("[ДЕМО] RX", lines[1])
+                self.assertEqual(capture.getvalue(), "")
+                self.assertTrue(window.log_view.isVisible())
+                self.assertIs(window.log_view.window(), window)
+                self.assertIsNone(window.worker)
+            window.set_pause(True)
+            window.log_view.clear()
+            for _ in range(5):
+                window.tick()
+            self.assertIn("[ДЕМО] RX", window.log_view.toPlainText())
+        finally:
+            window.log_file = None
+
     def test_connection_capture_and_no_automatic_requests(self):
         window = self.window
         class Capture(io.StringIO):

@@ -29,6 +29,7 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.setMinimumSize(1050, 700)
         self.rate = 1000
         self.sample_index = 0
+        self.demo_logged_sample = 0
         self.running = False
         self.paused = False
         self.worker = None
@@ -85,9 +86,14 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.badge.setObjectName("badge")
         header.addWidget(self.badge)
         layout.addLayout(header)
-        body = QtWidgets.QHBoxLayout()
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        splitter.setChildrenCollapsible(False)
+        layout.addWidget(splitter, 1)
+        body_widget = QtWidgets.QWidget()
+        body = QtWidgets.QHBoxLayout(body_widget)
+        body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(18)
-        layout.addLayout(body, 1)
+        splitter.addWidget(body_widget)
         sidebar = QtWidgets.QWidget()
         sidebar.setMinimumWidth(260)
         side = QtWidgets.QVBoxLayout(sidebar)
@@ -206,6 +212,7 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         main.addLayout(toolbar)
         pg.setConfigOptions(antialias=True)
         self.plot = pg.PlotWidget(background="#101b2b")
+        self.plot.setMinimumHeight(150)
         self.plot.setLabel("left", "Уровень CH1, код")
         self.plot.setLabel("bottom", "Время", units="s")
         self.plot.showGrid(x=True, y=True, alpha=0.15)
@@ -251,22 +258,32 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.device_info.setWordWrap(True)
         self.device_info.setObjectName("muted")
         main.addWidget(self.device_info)
-        self.log_dialog = QtWidgets.QDialog(self)
-        self.log_dialog.setWindowTitle("Журнал обмена — исходные байты TX / RX")
-        self.log_dialog.resize(940, 500)
-        log_layout = QtWidgets.QVBoxLayout(self.log_dialog)
+        log_panel = QtWidgets.QGroupBox("ЖУРНАЛ ОБМЕНА · TX / RX · HEX")
+        log_panel.setMinimumHeight(150)
+        log_layout = QtWidgets.QVBoxLayout(log_panel)
+        log_header = QtWidgets.QHBoxLayout()
         self.log_path = QtWidgets.QLabel("Файл журнала создаётся при подключении в папке captures.")
         self.log_path.setWordWrap(True)
-        log_layout.addWidget(self.log_path)
+        log_header.addWidget(self.log_path, 1)
+        clear_log = QtWidgets.QPushButton("Очистить экран журнала")
+        clear_log.setToolTip("Очищает только экран. Файл обмена с прибором сохраняется.")
+        clear_log.clicked.connect(lambda: self.log_view.clear())
+        log_header.addWidget(clear_log)
+        log_layout.addLayout(log_header)
         self.log_view = QtWidgets.QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(500)
         self.log_view.setStyleSheet("font-family:Consolas; font-size:12px")
+        self.log_view.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
         log_layout.addWidget(self.log_view)
+        splitter.addWidget(log_panel)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([510, 210])
 
     def show_log(self):
-        self.log_dialog.show()
-        self.log_dialog.raise_()
+        self.log_view.setFocus()
+        self.log_view.moveCursor(QtGui.QTextCursor.End)
 
     def reset_protocol(self, *_):
         if not hasattr(self, "hex_commands") or not hasattr(self, "crc_mode"):
@@ -374,11 +391,12 @@ class TestbenchWindow(QtWidgets.QMainWindow):
             worker.deleteLater()
         self.update_status()
 
-    def record(self, direction, data, stamp):
+    def record(self, direction, data, stamp, simulated=False):
         utc = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         if direction in ("TX", "RX"):
-            self.log_view.appendPlainText(f"{utc} {direction}  {data.hex(' ').upper()}")
-        if self.log_file is not None:
+            source = "[ДЕМО] " if simulated else "[ПРИБОР] "
+            self.log_view.appendPlainText(f"{utc} {source}{direction}  {data.hex(' ').upper()}")
+        if self.log_file is not None and not simulated:
             record = dict(utc=utc, monotonic_s=stamp, direction=direction, hex=data.hex(" ").upper(),
                           command_numbers="HEX" if self.hex_commands.isChecked() else "DEC",
                           tx_crc=self.crc_mode.currentData(), port=self.port.currentData(),
@@ -537,9 +555,23 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.times.extend(times)
         for buffer, signal in zip(self.values, signals):
             buffer.extend(np.clip(np.rint(signal), 0, 4095).astype(int))
+        if self.sample_index - self.demo_logged_sample >= self.rate // 5:
+            self.demo_logged_sample = self.sample_index
+            self.demo_exchange(int(self.values[0][-1]))
         self.buffer_label.setText(f"В буфере: {len(self.times):,} отсчётов/канал · демо · 1 000 отсчётов/с".replace(",", " "))
         if not self.paused:
             self.update_plot()
+
+    def demo_exchange(self, value):
+        command = command_code(25, self.hex_commands.isChecked())
+        mode = self.crc_mode.currentData()
+        data = value.to_bytes(2, "little")
+        checksum = (command + sum(data)) & 255
+        crc = bytes([checksum]) if mode == "raw" else f"{checksum:02X}".encode("ascii")
+        reply = b"!" + f"{command:02X}".encode("ascii") + data.hex().upper().encode("ascii") + crc + b"\r"
+        stamp = time.monotonic()
+        self.record("TX", encode_request(command, mode), stamp, simulated=True)
+        self.record("RX", reply, stamp, simulated=True)
 
     def update_plot(self, *_):
         if not hasattr(self, "curves"):
@@ -574,6 +606,7 @@ class TestbenchWindow(QtWidgets.QMainWindow):
             buffer.clear()
             curve.setData([], [])
         self.sample_index = 0
+        self.demo_logged_sample = 0
         self.session_start = time.monotonic()
         for label in self.stat_labels:
             label.setText("—")
