@@ -13,18 +13,39 @@ import numpy as np
 from qt_compat import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 from serial.tools import list_ports
-from protocol import ReplyParser, command_code, describe_reply, describe_request, encode_request
+from protocol import (ADC_CHANNEL_NAMES, ADC_CSV_COLUMNS, FW018_LENGTHS, AdcStreamParser, ReplyParser,
+                      command_code, decode_working_snapshot, describe_adc_sample, describe_device_state, describe_reply,
+                      describe_request, encode_request)
 from transport import SerialWorker
+from swd import ThresholdSnapshot, ThresholdWorker
+from battery import BatteryBatchFilter
 
 CHANNEL_COLORS = ["#45d7d0", "#f4bd61", "#8fb6ff", "#e591c8",
                   "#a4d66f", "#ff927b", "#b6a0ef", "#d8e2ef"]
 CHANNEL_COUNT = len(CHANNEL_COLORS)
+CH2_MV_PER_CODE = 3300.0 / 4095
+BATTERY_VREF_V = 3.3
+BATTERY_R_TOP_KOHM = 22.0
+BATTERY_R_BOTTOM_KOHM = 42.2
+BATTERY_V_PER_CODE = BATTERY_VREF_V / 4095 * (BATTERY_R_TOP_KOHM + BATTERY_R_BOTTOM_KOHM) / BATTERY_R_BOTTOM_KOHM
+
+
+class Ch2MillivoltAxis(pg.AxisItem):
+    """Secondary labels for the shared ADC-code coordinate system."""
+
+    def tickStrings(self, values, scale, spacing):
+        return [f"{value * CH2_MV_PER_CODE:.1f}" for value in values]
+
+
+class BatteryVoltageAxis(pg.AxisItem):
+    def tickStrings(self, values, scale, spacing):
+        return [f"{value * BATTERY_V_PER_CODE:.3f}" for value in values]
 
 
 class TestbenchWindow(QtWidgets.QMainWindow):
-    def __init__(self):
+    def __init__(self, swd_auto_start=True):
         super().__init__()
-        self.setWindowTitle("ADC / DAC Testbench — прототип")
+        self.setWindowTitle("ADC / DAC Testbench — тестовая / v0.18")
         self.resize(1320, 820)
         self.setMinimumSize(1050, 700)
         self.rate = 1000
@@ -33,6 +54,25 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.running = False
         self.paused = False
         self.worker = None
+        self.threshold_worker = None
+        self.threshold_reads = 0
+        self.swd_auto_start = swd_auto_start
+        self.threshold_snapshot = None
+        self.threshold_times = deque(maxlen=60000)
+        self.threshold_signals = deque(maxlen=60000)
+        self.threshold_plot_visible = False
+        self.threshold_legend_state = None
+        self.last_uart_snapshot = None
+        self.last_swd_snapshot = None
+        self.last_swd_stamp = 0
+        self.last_noise = None
+        self.last_state_stamp = 0
+        self.gain_read_needed = False
+        self.gain_requested = None
+        self.queued_gain = None
+        self.queued_query = None
+        self.working_thresholds = deque(maxlen=60000)
+        self.working_states = deque(maxlen=60000)
         self.device_ready = False
         self.pending = None
         self.log_file = None
@@ -40,14 +80,21 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.session_start = time.monotonic()
         self.reply_parser = ReplyParser({})
         self.log_reply_parser = ReplyParser({})
+        self.adc_parser = AdcStreamParser()
+        self.log_adc_parser = AdcStreamParser()
+        self.buffer_format = "protocol"
         self.rng = np.random.default_rng()
         self.times = deque(maxlen=60000)
         self.values = [deque(maxlen=60000) for _ in range(CHANNEL_COUNT)]
+        self.battery_filter = BatteryBatchFilter()
+        self.filtered_battery_values = deque(maxlen=60000)
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(40)
         self.timer.timeout.connect(self.tick)
         self.build_menu()
         self.build_window()
+        self.change_receive_mode()
+        self.configure_channels()
         self.refresh_ports()
         self.port_timer = QtCore.QTimer(self)
         self.port_timer.setInterval(1500)
@@ -121,8 +168,15 @@ class TestbenchWindow(QtWidgets.QMainWindow):
                             [1200, 1800, 2400, 4800, 9600, 14400, 19200, 28800,
                              38400, 57600, 76800, 115200, 128000, 153600, 230400,
                              250000, 256000, 460800, 500000, 576000, 921600, 1000000]])
-        self.baud.setCurrentText("9600")
+        self.baud.setCurrentText("19200")
         form.addRow("Скорость", self.baud)
+        self.receive_mode = QtWidgets.QComboBox()
+        self.receive_mode.addItem("Рабочая v0.18", "fw018")
+        self.receive_mode.addItem("Тестовая · АЦП A0–A2", "adc_stream")
+        self.receive_mode.addItem("Протокол 0.0 (вручную)", "protocol")
+        self.receive_mode.setToolTip("v0.18: сигнал и порог по UART. Тестовая: поток A0/A1/A2 без CRC.")
+        self.receive_mode.currentIndexChanged.connect(self.change_receive_mode)
+        form.addRow("Формат", self.receive_mode)
         format_label = QtWidgets.QLabel("8 бит · без чётности · 1 стоп-бит")
         format_label.setObjectName("muted")
         form.addRow(format_label)
@@ -132,13 +186,13 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.connect_button = QtWidgets.QPushButton("Подключить прибор")
         self.connect_button.clicked.connect(self.toggle_connection)
         form.addRow(self.connect_button)
-        note = QtWidgets.QLabel("Список портов обновляется автоматически.\nПосле подключения запросы отправляются кнопками ниже.")
+        note = QtWidgets.QLabel("v0.18 и тестовая: 19200, 8N1.\nВыберите установленную прошивку.")
         note.setWordWrap(True)
         note.setObjectName("muted")
         form.addRow(note)
         port_layout.addWidget(connection)
         port_layout.addStretch()
-        protocol_group = QtWidgets.QGroupBox("ПРОТОКОЛ / ПРОБНЫЙ ОБМЕН")
+        protocol_group = QtWidgets.QGroupBox("ОБМЕН С ПРИБОРОМ")
         protocol_form = QtWidgets.QVBoxLayout(protocol_group)
         self.hex_commands = QtWidgets.QCheckBox("Номера команд в HEX")
         self.hex_commands.setToolTip("Снято: 25 → 0x19 (DEC). Установлено: 25 → 0x25 (HEX).")
@@ -150,15 +204,48 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.crc_mode.currentIndexChanged.connect(self.reset_protocol)
         protocol_form.addWidget(self.crc_mode)
         self.query_buttons = []
-        for text, command in [("Версия ПО · 5", 5), ("Состояние · 3", 3), ("Текущий уровень · 25", 25)]:
+        query_grid = QtWidgets.QGridLayout()
+        for text, command in [("Версия ПО · 5", 5), ("Состояние · 3", 3), ("Уровень · 25", 25),
+                              ("Сигнал · 11", 11)]:
             button = QtWidgets.QPushButton(text)
             button.setEnabled(False)
+            button.setProperty("command", command)
+            button.setToolTip(f"Команда {command}" + (": сигнал, порог и состояние v0.18" if command == 11 else ""))
             button.clicked.connect(lambda checked=False, number=command: self.query(number))
-            protocol_form.addWidget(button)
+            index = len(self.query_buttons)
+            query_grid.addWidget(button, index // 2, index % 2)
             self.query_buttons.append(button)
+        protocol_form.addLayout(query_grid)
         self.poll = QtWidgets.QCheckBox("Опрос уровня каждые 200 мс")
         self.poll.setEnabled(False)
         protocol_form.addWidget(self.poll)
+        self.gain_group = gain_group = QtWidgets.QGroupBox("УСИЛЕНИЕ · v0.18")
+        gain_form = QtWidgets.QVBoxLayout(gain_group)
+        self.gain_info = QtWidgets.QLabel("Текущая ступень: —")
+        self.gain_info.setWordWrap(True)
+        gain_form.addWidget(self.gain_info)
+        gain_grid = QtWidgets.QGridLayout()
+        self.gain_buttons = []
+        self.gain_button_group = QtWidgets.QButtonGroup(self)
+        self.gain_button_group.setExclusive(True)
+        for step in range(1, 9):
+            button = QtWidgets.QPushButton(str(step))
+            button.setCheckable(True)
+            button.setToolTip(f"Установить ступень усиления {step}; значение проверяется чтением")
+            button.setStyleSheet("QPushButton:checked { background:#167e85; border-color:#45d7d0; color:white; }")
+            button.clicked.connect(lambda checked=False, value=step: self.select_gain(value))
+            self.gain_button_group.addButton(button, step)
+            self.gain_buttons.append(button)
+            gain_grid.addWidget(button, (step - 1) // 4, (step - 1) % 4)
+        gain_form.addLayout(gain_grid)
+        self.gain_read = QtWidgets.QPushButton("Прочитать усиление")
+        self.gain_read.clicked.connect(lambda: self.query(15))
+        gain_form.addWidget(self.gain_read)
+        protocol_form.addWidget(gain_group)
+        self.read_thresholds = QtWidgets.QCheckBox("Пороги через ST-Link / SWD")
+        self.read_thresholds.setToolTip("Читает ОЗУ выбранной прошивки через HOTPLUG. Для v0.18 порог срабатывания доступен и по UART.")
+        self.read_thresholds.toggled.connect(self.toggle_thresholds)
+        protocol_form.addWidget(self.read_thresholds)
         log_button = QtWidgets.QPushButton("Журнал TX / RX (HEX)")
         log_button.clicked.connect(self.show_log)
         protocol_form.addWidget(log_button)
@@ -176,7 +263,10 @@ class TestbenchWindow(QtWidgets.QMainWindow):
             check.toggled.connect(self.update_plot)
             self.channel_checks.append(check)
             channel_layout.addWidget(check, index // 2, index % 2)
-        channel_layout.addWidget(QtWidgets.QLabel("CH1: уровень, код / мВ\nCH2–CH8: резерв"), 4, 0, 1, 2)
+        self.channel_note = QtWidgets.QLabel("Поток АЦП:\n" + "\n".join(
+            f"CH{index + 1} / A{index}: {name}" for index, name in enumerate(ADC_CHANNEL_NAMES)))
+        self.channel_note.setWordWrap(True)
+        channel_layout.addWidget(self.channel_note, 4, 0, 1, 2)
         side.addWidget(channels)
         acquisition = QtWidgets.QGroupBox("ОТОБРАЖЕНИЕ")
         acquisition_form = QtWidgets.QFormLayout(acquisition)
@@ -185,7 +275,7 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.window_seconds.setCurrentText("10")
         self.window_seconds.currentTextChanged.connect(self.update_plot)
         acquisition_form.addRow("Окно, с", self.window_seconds)
-        acquisition_form.addRow(QtWidgets.QLabel("Прибор: уровень по команде 25\nБуфер: последние 60 секунд"))
+        acquisition_form.addRow(QtWidgets.QLabel("Время прибора — по приёму ПК\nБуфер: последние 60 секунд"))
         side.addWidget(acquisition)
         dac_note = QtWidgets.QLabel("ЦАП\nУправление добавим после\nсогласования команд прибора.")
         dac_note.setObjectName("muted")
@@ -203,21 +293,40 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.pause.setCheckable(True)
         self.pause.toggled.connect(self.set_pause)
         toolbar.addWidget(self.pause)
-        toolbar.addStretch()
         auto = QtWidgets.QPushButton("Автомасштаб")
         auto.clicked.connect(self.autoscale)
         toolbar.addWidget(auto)
         clear = QtWidgets.QPushButton("Очистить")
         clear.clicked.connect(self.clear_data)
         toolbar.addWidget(clear)
+        self.battery_filter_check = QtWidgets.QCheckBox("Фильтр CH3")
+        self.battery_filter_check.setChecked(True)
+        self.battery_filter_check.setEnabled(False)
+        self.battery_filter_check.setToolTip("Массив 256 отсчётов: отбросить 10% снизу и сверху, усреднить оставшиеся. Новый результат примерно раз в 4,5 с.")
+        self.battery_filter_check.toggled.connect(self.update_plot)
+        toolbar.addWidget(self.battery_filter_check)
+        toolbar.addStretch()
+        self.battery_readout = QtWidgets.QLabel("CH3: — В")
+        self.battery_readout.setStyleSheet(f"color:{CHANNEL_COLORS[2]}; font-size:18px; font-weight:600")
+        self.battery_readout.setToolTip("Питание: код × 3,3 / 4095 × (22 + 42,2) / 42,2. Значения резисторов в кОм.")
+        self.battery_readout.setVisible(False)
+        toolbar.addWidget(self.battery_readout)
         main.addLayout(toolbar)
         pg.setConfigOptions(antialias=True)
-        self.plot = pg.PlotWidget(background="#101b2b")
+        self.ch2_mv_axis = Ch2MillivoltAxis(orientation="right")
+        self.ch2_mv_axis.setLabel("CH2, мВ · опора 3,3 В", color=CHANNEL_COLORS[1])
+        self.ch2_mv_axis.setTextPen(CHANNEL_COLORS[1])
+        self.ch2_mv_axis.enableAutoSIPrefix(False)
+        self.ch2_mv_axis.setWidth(75)
+        self.plot = pg.PlotWidget(background="#101b2b", axisItems={"right": self.ch2_mv_axis})
+        self.plot.showAxis("right", False)
         self.plot.setMinimumHeight(150)
         self.plot.setLabel("left", "Уровень CH1, код")
         self.plot.setLabel("bottom", "Время", units="s")
         self.plot.showGrid(x=True, y=True, alpha=0.15)
-        self.plot.addLegend(offset=(15, 10))
+        legend = self.plot.addLegend(offset=(15, 10))
+        legend.setColumnCount(2)
+        legend.setZValue(1000)
         self.plot.setYRange(1950, 2370)
         self.plot.setXRange(0, 10, padding=0)
         self.plot.setClipToView(True)
@@ -226,39 +335,97 @@ class TestbenchWindow(QtWidgets.QMainWindow):
                        for index, color in enumerate(CHANNEL_COLORS)]
         for curve in self.curves[1:]:
             curve.setVisible(False)
+        self.battery_axis = BatteryVoltageAxis(orientation="right")
+        self.battery_axis.setLabel("CH3 · питание, В", color=CHANNEL_COLORS[2])
+        self.battery_axis.setTextPen(CHANNEL_COLORS[2])
+        self.battery_axis.enableAutoSIPrefix(False)
+        self.battery_axis.setWidth(70)
+        self.battery_axis.linkToView(self.plot.getViewBox())
+        self.plot.plotItem.layout.addItem(self.battery_axis, 2, 3)
+        self.battery_axis.hide()
+        self.threshold_axis = pg.AxisItem(orientation="right")
+        self.threshold_axis.setLabel("Обработка / пороги, ед.", color="#e591c8")
+        self.threshold_axis.setTextPen("#e591c8")
+        self.threshold_axis.enableAutoSIPrefix(False)
+        self.threshold_axis.setWidth(85)
+        self.plot.plotItem.layout.addItem(self.threshold_axis, 2, 4)
+        self.threshold_view = pg.ViewBox()
+        self.plot.scene().addItem(self.threshold_view)
+        self.threshold_axis.linkToView(self.threshold_view)
+        self.threshold_view.setXLink(self.plot.getViewBox())
+        self.threshold_signal_curve = pg.PlotDataItem(pen=pg.mkPen("#e591c8", width=1))
+        self.threshold_view.addItem(self.threshold_signal_curve)
+        self.trigger_lines = [pg.InfiniteLine(angle=0, pen=pg.mkPen("#ff927b", width=1)) for _ in range(2)]
+        self.release_lines = [pg.InfiniteLine(angle=0, pen=pg.mkPen("#8fb6ff", width=1, style=QtCore.Qt.DashLine))
+                              for _ in range(2)]
+        for line in self.trigger_lines + self.release_lines:
+            self.threshold_view.addItem(line)
+        self.threshold_legend_samples = [pg.PlotDataItem(pen=line.pen) for line in
+                                         (self.trigger_lines[0], self.release_lines[0])]
+        self.threshold_axis.hide()
+        self.threshold_view.hide()
+        self.plot.getViewBox().sigResized.connect(self.sync_threshold_view)
+        self.sync_threshold_view()
         main.addWidget(self.plot, 1)
         hint = QtWidgets.QLabel("Колесо мыши — масштаб · перетаскивание — перемещение · правая кнопка — меню графика")
         hint.setObjectName("muted")
         main.addWidget(hint)
         stats = QtWidgets.QHBoxLayout()
         self.stat_labels = []
-        for caption in ["CH1 · ТЕКУЩЕЕ", "МИНИМУМ", "МАКСИМУМ", "РАЗМАХ P–P", "СКО"]:
+        self.stat_ch3_labels = []
+        for caption in ["ТЕКУЩЕЕ", "МИНИМУМ", "МАКСИМУМ", "РАЗМАХ P–P", "СКО"]:
             frame = QtWidgets.QFrame()
             frame.setObjectName("stat")
+            frame.setFixedHeight(36)
             box = QtWidgets.QVBoxLayout(frame)
+            box.setContentsMargins(8, 1, 8, 1)
+            box.setSpacing(0)
             label = QtWidgets.QLabel(caption)
             label.setObjectName("muted")
-            label.setStyleSheet("font-size:10px")
-            value = QtWidgets.QLabel("—")
-            value.setStyleSheet("font-size:23px; font-weight:600")
+            label.setStyleSheet("font-size:9px")
+            value = QtWidgets.QLabel("CH1 —")
+            value.setStyleSheet(f"font-size:12px; font-weight:600; color:{CHANNEL_COLORS[0]}")
+            value.setToolTip("CH1: коды АЦП по видимому окну")
+            battery_value = QtWidgets.QLabel("CH3 — В")
+            battery_value.setStyleSheet(f"font-size:12px; font-weight:600; color:{CHANNEL_COLORS[2]}")
+            battery_value.setToolTip("CH3: напряжение питания в вольтах по видимому окну")
+            battery_value.setVisible(False)
+            numbers = QtWidgets.QHBoxLayout()
+            numbers.setSpacing(6)
+            numbers.addWidget(value)
+            numbers.addStretch()
+            numbers.addWidget(battery_value)
             box.addWidget(label)
-            box.addWidget(value)
+            box.addLayout(numbers)
             stats.addWidget(frame)
             self.stat_labels.append(value)
+            self.stat_ch3_labels.append(battery_value)
         main.addLayout(stats)
         footer = QtWidgets.QHBoxLayout()
         self.buffer_label = QtWidgets.QLabel("Буфер пуст")
         self.buffer_label.setObjectName("muted")
         footer.addWidget(self.buffer_label)
         footer.addStretch()
+        self.ch2_readout = QtWidgets.QLabel("CH2: — код / — мВ")
+        self.ch2_readout.setStyleSheet(f"color:{CHANNEL_COLORS[1]}")
+        self.ch2_readout.setVisible(False)
+        footer.addWidget(self.ch2_readout)
         save = QtWidgets.QPushButton("Сохранить буфер CSV…")
         save.clicked.connect(self.export_csv)
         footer.addWidget(save)
         main.addLayout(footer)
-        self.device_info = QtWidgets.QLabel("Прибор не подключён · 9600 8N1 · CH1 — средневыпрямленный уровень")
+        self.device_info = QtWidgets.QLabel("Прибор не подключён · поток A0–A2: 19200 8N1, без CRC")
         self.device_info.setWordWrap(True)
         self.device_info.setObjectName("muted")
         main.addWidget(self.device_info)
+        self.device_state_info = QtWidgets.QLabel("Диагностика кабеля: нет данных")
+        self.device_state_info.setWordWrap(True)
+        main.addWidget(self.device_state_info)
+        self.threshold_info = QtWidgets.QLabel("Пороги: чтение через ST-Link выключено")
+        self.threshold_info.setWordWrap(True)
+        self.threshold_info.setObjectName("muted")
+        self.threshold_info.setStyleSheet(f"color:{CHANNEL_COLORS[1]}")
+        main.addWidget(self.threshold_info)
         log_panel = QtWidgets.QGroupBox("ЖУРНАЛ ОБМЕНА · TX / RX · HEX")
         log_panel.setMinimumHeight(150)
         log_layout = QtWidgets.QVBoxLayout(log_panel)
@@ -289,19 +456,130 @@ class TestbenchWindow(QtWidgets.QMainWindow):
     def reset_protocol(self, *_):
         if not hasattr(self, "hex_commands") or not hasattr(self, "crc_mode"):
             return
-        self.reply_parser = ReplyParser({command_code(number, self.hex_commands.isChecked()): length
-                                         for number, length in [(3, 1), (5, 2), (25, 2)]})
-        self.log_reply_parser = ReplyParser(self.reply_parser.lengths)
+        working = self.receive_mode.currentData() == "fw018"
+        lengths = FW018_LENGTHS if working else {command_code(number, self.hex_commands.isChecked()): length
+                                               for number, length in [(3, 1), (5, 2), (25, 2)]}
+        kwargs = dict(error_size=1, checksum_modes=("hex",)) if working else {}
+        self.reply_parser = ReplyParser(lengths, **kwargs)
+        self.log_reply_parser = ReplyParser(lengths, **kwargs)
+        self.adc_parser = AdcStreamParser()
+        self.log_adc_parser = AdcStreamParser()
         if self.log_file is not None:
             self.record("CONFIG", b"", time.monotonic())
 
+    def change_receive_mode(self, *_):
+        if self.threshold_worker is not None:
+            self.read_thresholds.setChecked(False)
+        working = self.receive_mode.currentData() == "fw018"
+        self.hex_commands.setVisible(self.receive_mode.currentData() == "protocol")
+        self.crc_mode.setVisible(self.receive_mode.currentData() == "protocol")
+        self.gain_group.setVisible(working)
+        self.baud.setCurrentText("9600" if self.receive_mode.currentData() == "protocol" else "19200")
+        if working:
+            self.hex_commands.setChecked(False)
+            self.crc_mode.setCurrentIndex(self.crc_mode.findData("hex"))
+        elif self.receive_mode.currentData() == "protocol":
+            self.crc_mode.setCurrentIndex(self.crc_mode.findData("raw"))
+        self.poll.setText("Опрос сигнала и порога · 200 мс" if working else "Опрос уровня каждые 200 мс")
+        for button in self.query_buttons:
+            if button.property("command") == 25:
+                button.setText("Фон · 25" if working else "Уровень · 25")
+        self.reset_protocol()
+        self.gain_read_needed = False
+        self.gain_requested = None
+        self.queued_gain = None
+        self.queued_query = None
+        self.gain_button_group.setExclusive(False)
+        for button in self.gain_buttons:
+            button.setChecked(False)
+        self.gain_button_group.setExclusive(True)
+        self.gain_info.setText("Текущая ступень: —" if working else "В тестовой прошивке UART-команда недоступна")
+        self.set_request_controls()
+
+    def configure_channels(self, stream=False):
+        self.threshold_plot_visible = False
+        self.threshold_legend_state = None
+        self.plot.plotItem.legend.clear()
+        working = self.buffer_format == "fw018" and self.source == "device"
+        self.curves[0].setPen(pg.mkPen(CHANNEL_COLORS[1] if working else CHANNEL_COLORS[0], width=1.5))
+        short_names = ("КЧЭ", "Тревога", "Батарея")
+        for index, (check, curve) in enumerate(zip(self.channel_checks, self.curves)):
+            enabled = index < (3 if stream else 1)
+            label = f"CH{index + 1}" + (f" · {short_names[index]}" if stream and enabled else "")
+            if working and index == 0:
+                label = "Сигнал · обработка"
+            check.setText(label)
+            check.setEnabled(enabled)
+            check.setChecked(enabled)
+            check.setToolTip(f"A{index}: {ADC_CHANNEL_NAMES[index]} · код АЦП" if stream and enabled else
+                             "Текущий уровень прибора" if index == 0 else "Резерв")
+            if enabled:
+                legend_label = f"CH{index + 1} / A{index} · {ADC_CHANNEL_NAMES[index]}" if stream else label
+                self.plot.plotItem.legend.addItem(curve, legend_label)
+        self.channel_note.setText("\n".join(f"CH{index + 1} / A{index}: {name}"
+                                            for index, name in enumerate(ADC_CHANNEL_NAMES)) if stream else
+                                  "CH1: уровень, код / мВ\nCH2–CH8: резерв")
+        if working:
+            self.channel_note.setText("v0.18: обработанный сигнал и порог по UART.\nСырые CH1–CH3 и батарея не передаются.")
+        self.plot.setLabel("left", "АЦП, код" if stream else "Уровень CH1, код")
+        if working:
+            self.plot.setLabel("left", "Обработка, ед.")
+        self.ch2_readout.setVisible(stream)
+        self.battery_readout.setVisible(stream)
+        self.battery_filter_check.setEnabled(stream)
+        self.battery_filter_check.setVisible(stream)
+        for label in self.stat_ch3_labels:
+            label.setVisible(stream)
+        self.show_device_state(None, "тестовая прошивка не передаёт состояние кабеля" if stream else
+                               "ожидание состояния прибора" if self.source == "device" else "демонстрационный режим")
+        self.refresh_legend()
+        # Recalculate after Qt has laid out the window and the legend labels.
+        QtCore.QTimer.singleShot(0, self.refresh_legend)
+
+    def refresh_legend(self):
+        legend = self.plot.plotItem.legend
+        legend.layout.activate()
+        legend.updateSize()
+        legend.setVisible(bool(legend.items))
+        legend.update()
+
+    def show_device_state(self, state, reason="нет данных"):
+        self.last_state_stamp = time.monotonic() if state is not None else 0
+        color = "#91a3bb"
+        if state is None:
+            text = "Диагностика кабеля: " + reason
+        else:
+            text = f"Состояние 0x{state:02X}: {describe_device_state(state)}"
+            if state & 0x24:
+                cable = []
+                if state & 4:
+                    cable.append("ОБРЫВ КАБЕЛЯ")
+                if state & 32:
+                    cable.append("КЗ КАБЕЛЯ")
+                text = " / ".join(cable) + " · " + text
+                color = "#ff927b"
+            elif state == 0:
+                text = "Кабель: обрыв / КЗ не обнаружены · " + text
+                color = "#45d7d0"
+            else:
+                text = "Кабель: обрыв / КЗ не заявлены · " + text
+                color = "#f4bd61"
+        self.device_state_info.setText(text)
+        self.device_state_info.setStyleSheet(f"color:{color}; font-weight:600")
+
     def set_request_controls(self):
         idle = self.pending is None
+        mode = self.receive_mode.currentData()
+        protocol = mode in ("protocol", "fw018")
         for button in self.query_buttons:
-            button.setEnabled(self.device_ready and idle)
-        self.hex_commands.setEnabled(idle)
-        self.crc_mode.setEnabled(idle)
-        self.poll.setEnabled(self.device_ready)
+            button.setEnabled(self.device_ready and protocol
+                              and (button.property("command") != 11 or mode == "fw018"))
+        self.hex_commands.setEnabled(idle and mode == "protocol")
+        self.crc_mode.setEnabled(idle and mode == "protocol")
+        self.poll.setEnabled(self.device_ready and protocol)
+        gain_enabled = self.device_ready and mode == "fw018"
+        for widget in (*self.gain_buttons, self.gain_read):
+            widget.setEnabled(gain_enabled)
 
     def toggle_connection(self):
         if self.worker is not None:
@@ -337,9 +615,13 @@ class TestbenchWindow(QtWidgets.QMainWindow):
                 return
         self.source = "device"
         self.clear_data()
+        self.buffer_format = self.receive_mode.currentData()
+        self.configure_channels(self.buffer_format == "adc_stream")
         self.reset_protocol()
         self.log_path.setText(str(capture_path))
-        self.badge.setText("●  ПРИБОР · УРОВЕНЬ CH1")
+        self.badge.setText("●  ПРИБОР · A0–A2" if self.buffer_format == "adc_stream" else "●  ПРИБОР · УРОВЕНЬ CH1")
+        if self.buffer_format == "fw018":
+            self.badge.setText("●  ПРИБОР · v0.18 · UART")
         self.plot.enableAutoRange(axis="y", enable=True)
         self.worker = SerialWorker(port, int(self.baud.currentText()), self)
         self.worker.opened.connect(self.device_opened)
@@ -349,6 +631,7 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.worker.finished.connect(self.device_finished)
         self.port.setEnabled(False)
         self.baud.setEnabled(False)
+        self.receive_mode.setEnabled(False)
         self.start.setEnabled(False)
         self.connect_button.setText("Отключить прибор")
         self.device_info.setText(f"Открытие {port} · {self.baud.currentText()} 8N1…")
@@ -361,11 +644,24 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.pending = None
         self.last_poll = time.monotonic()
         self.set_request_controls()
-        self.device_info.setText("Порт открыт. Нажмите «Версия ПО» для первого запроса. Обмен записывается в журнал.")
-        self.sidebar_tabs.setCurrentIndex(1)
+        stream = self.receive_mode.currentData() == "adc_stream"
+        self.device_info.setText("Ожидается поток A0–A2 · без CRC · запросы не нужны." if stream else
+                                 "Порт открыт. Нажмите «Версия ПО» для первого запроса. Обмен записывается в журнал.")
+        self.sidebar_tabs.setCurrentIndex(2 if stream else 1)
+        if stream and self.swd_auto_start:
+            self.read_thresholds.setChecked(True)
+        if self.receive_mode.currentData() == "fw018":
+            self.gain_read_needed = True
+            self.gain_requested = None
+            self.gain_info.setText("Текущая ступень: чтение…")
+            self.poll.setChecked(True)
+            self.query(5)
         self.update_status()
 
     def device_failed(self, message):
+        self.show_device_state(None, "ошибка COM-порта")
+        self.queued_gain = None
+        self.queued_query = None
         self.device_ready = False
         self.poll.setChecked(False)
         self.device_info.setText("Ошибка COM-порта: " + message)
@@ -373,6 +669,9 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.set_request_controls()
 
     def device_finished(self):
+        self.show_device_state(None, "прибор отключён")
+        self.queued_gain = None
+        self.queued_query = None
         worker = self.worker
         self.worker = None
         self.device_ready = False
@@ -381,6 +680,7 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.set_request_controls()
         self.port.setEnabled(True)
         self.baud.setEnabled(True)
+        self.receive_mode.setEnabled(True)
         self.start.setEnabled(True)
         self.connect_button.setEnabled(True)
         self.connect_button.setText("Подключить прибор")
@@ -398,14 +698,21 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         description = ""
         if direction in ("TX", "RX"):
             hex_numbers = self.hex_commands.isChecked()
+            firmware = "fw018" if self.receive_mode.currentData() == "fw018" and not simulated else "legacy"
             if direction == "TX":
-                description = describe_request(data, hex_numbers)
+                description = describe_request(data, hex_numbers, firmware)
+            elif not simulated and self.receive_mode.currentData() == "adc_stream":
+                samples = self.log_adc_parser.feed(data)
+                description = " | ".join(describe_adc_sample(sample) for sample in samples)
+                if not description:
+                    description = ("Фрагмент строки A0–A2; ожидается продолжение" if self.log_adc_parser.buffer else
+                                   "Строка A0–A2 не распознана; проверьте скорость (19200 8N1) и формат")
             else:
                 parser = (ReplyParser({command_code(number, hex_numbers): length
                                        for number, length in [(3, 1), (5, 2), (25, 2)]})
                           if simulated else self.log_reply_parser)
                 replies = parser.feed(data)
-                description = " | ".join(describe_reply(reply, hex_numbers) for reply in replies)
+                description = " | ".join(describe_reply(reply, hex_numbers, firmware) for reply in replies)
                 if not description:
                     description = "Фрагмент ответа; ожидается продолжение" if parser.buffer else "Формат ответа или CRC не распознаны"
             source = "[ДЕМО]" if simulated else "[ПРИБОР]"
@@ -417,6 +724,9 @@ class TestbenchWindow(QtWidgets.QMainWindow):
             record = dict(utc=utc, monotonic_s=stamp, direction=direction, hex=data.hex(" ").upper(),
                           command_numbers="HEX" if self.hex_commands.isChecked() else "DEC",
                           tx_crc=self.crc_mode.currentData(), port=self.port.currentData(),
+                          receive_format=self.receive_mode.currentData(),
+                          battery_vref_V=BATTERY_VREF_V, battery_r_top_kohm=BATTERY_R_TOP_KOHM,
+                          battery_r_bottom_kohm=BATTERY_R_BOTTOM_KOHM,
                           baud=int(self.baud.currentText()), serial_format="8N1", description=description)
             try:
                 self.log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -429,53 +739,160 @@ class TestbenchWindow(QtWidgets.QMainWindow):
                 self.device_info.setText("Запись обмена остановлена: " + str(error))
 
     def query(self, number):
-        if not self.device_ready or self.pending is not None or number not in (3, 5, 25):
+        working = self.receive_mode.currentData() == "fw018"
+        if (self.receive_mode.currentData() not in ("protocol", "fw018") or not self.device_ready
+                or number not in ((3, 5, 11, 15, 25) if working else (3, 5, 25))):
             return
-        code = command_code(number, self.hex_commands.isChecked())
+        if self.pending is not None:
+            self.queued_query = number
+            return
+        code = number if working else command_code(number, self.hex_commands.isChecked())
         self.pending = dict(number=number, code=code, deadline=time.monotonic() + 1.0)
         self.last_poll = time.monotonic()
         self.set_request_controls()
-        self.worker.send(encode_request(code, self.crc_mode.currentData()))
+        self.worker.send(encode_request(code, "hex" if working else self.crc_mode.currentData()))
         self.device_info.setText(f"Ожидается ответ: команда {number}, байт 0x{code:02X}…")
+
+    def select_gain(self, step):
+        if self.receive_mode.currentData() != "fw018" or not self.device_ready or step not in range(1, 9):
+            return
+        self.queued_gain = step
+        self.gain_info.setText(f"Выбрана ступень {step} · ожидает отправки")
+        self.check_requests()
+
+    def apply_gain(self, step):
+        if self.receive_mode.currentData() != "fw018" or not self.device_ready or self.pending is not None:
+            return
+        if step not in range(1, 9):
+            return
+        self.gain_requested = step
+        self.gain_read_needed = False
+        self.pending = dict(number=45, code=45, deadline=time.monotonic() + 1.0)
+        self.last_poll = time.monotonic()
+        self.set_request_controls()
+        self.gain_info.setText(f"Запись ступени {step}…")
+        self.worker.send(encode_request(45, "hex", bytes([step])))
 
     def data_transmitted(self, data, stamp):
         self.record("TX", data, stamp)
         if self.pending is not None:
             self.pending["deadline"] = stamp + 0.5
+            if self.pending["code"] == 45:
+                self.pending["confirm_at"] = stamp + 0.2
 
     def check_requests(self):
         now = time.monotonic()
+        if self.last_state_stamp and now - self.last_state_stamp > 2:
+            self.show_device_state(None, "нет свежего состояния более 2 с")
+        # Confirm the actual setting even if the write acknowledgement was lost.
+        if self.pending is not None and self.pending["code"] == 45 and now >= self.pending.get("confirm_at", float("inf")):
+            self.pending = None
+            self.gain_read_needed = True
         if self.pending is not None and now >= self.pending["deadline"]:
             code = self.pending["code"]
             self.pending = None
             self.poll.setChecked(False)
+            self.show_device_state(None, "нет ответа от прибора")
             self.set_request_controls()
-            message = f"Нет корректного ответа на 0x{code:02X} за 500 мс. Проверьте журнал и вариант CRC / DEC / HEX."
+            self.gain_read_needed = False
+            if self.queued_gain is not None:
+                self.gain_info.setText("Смена усиления отменена: нет ответа от прибора")
+            self.queued_gain = None
+            self.queued_query = None
+            if code in (15, 45):
+                self.gain_info.setText("Усиление не подтверждено: нет ответа. Нажмите «Прочитать усиление».")
+            detail = ("Проверьте прошивку v0.18, скорость и журнал."
+                      if self.receive_mode.currentData() == "fw018" else "Проверьте журнал и вариант CRC / DEC / HEX.")
+            message = f"Нет корректного ответа на 0x{code:02X} за 500 мс. " + detail
+            if self.buffer_format == "fw018":
+                self.last_uart_snapshot = None
+                self.threshold_snapshot = None
+                self.refresh_threshold_plot()
+                self.threshold_info.setText("Пороги UART: опрос остановлен — нет корректного ответа")
             self.device_info.setText(message)
             self.log_view.appendPlainText(message)
-        if self.device_ready and self.poll.isChecked() and self.pending is None and now - self.last_poll >= 0.2:
-            self.query(25)
+        if self.receive_mode.currentData() == "fw018" and self.device_ready and self.pending is None and self.gain_read_needed:
+            self.gain_read_needed = False
+            self.query(15)
+            return
+        if self.device_ready and self.pending is None:
+            if self.queued_gain is not None:
+                step = self.queued_gain
+                self.queued_gain = None
+                self.apply_gain(step)
+                return
+            if self.queued_query is not None:
+                number = self.queued_query
+                self.queued_query = None
+                self.query(number)
+                return
+        if (self.receive_mode.currentData() in ("protocol", "fw018") and self.device_ready and self.poll.isChecked()
+                and self.pending is None and now - self.last_poll >= 0.2):
+            self.query(11 if self.receive_mode.currentData() == "fw018" else 25)
 
     def receive_data(self, data, stamp):
         self.record("RX", data, stamp)
+        if self.receive_mode.currentData() == "adc_stream":
+            previous = self.adc_parser.rejected
+            samples = self.adc_parser.feed(data)
+            for sample in samples:
+                self.add_device_sample(sample, stamp)
+            if samples:
+                self.device_info.setText(describe_adc_sample(samples[-1]))
+            elif self.adc_parser.rejected != previous:
+                self.device_info.setText("Поток A0–A2 не распознан. Проверьте скорость 19200, 8N1 и формат прошивки.")
+            return
         previous = self.reply_parser.rejected
         for reply in self.reply_parser.feed(data):
             if self.pending is not None and reply.command == self.pending["code"]:
                 self.pending = None
                 self.set_request_controls()
             if reply.device_error:
+                if reply.command in (3, 11):
+                    self.show_device_state(None, "прибор отклонил чтение состояния")
+                self.queued_gain = None
+                self.queued_query = None
                 self.poll.setChecked(False)
+                if reply.command in (15, 45):
+                    self.gain_read_needed = False
+                    self.gain_info.setText(f"Команда усиления отклонена: ошибка {reply.data[0] if reply.data else '—'}")
                 self.device_info.setText(f"Прибор отклонил команду 0x{reply.command:02X}; CRC {reply.checksum_mode} верна.")
+                continue
+            if self.receive_mode.currentData() == "fw018" and reply.command == 45:
+                self.gain_read_needed = True
+                self.gain_info.setText("Запись принята; контрольное чтение…")
+                continue
+            if self.receive_mode.currentData() == "fw018" and reply.command == 15:
+                step = reply.data[0]
+                suffix = ""
+                if self.gain_requested is not None:
+                    suffix = " · подтверждено" if step == self.gain_requested else f" · НЕ совпало с заданной {self.gain_requested}"
+                self.gain_info.setText(f"Текущая ступень: {step}" + suffix + (" · вне диапазона 1–8" if step not in range(1, 9) else ""))
+                self.gain_requested = None
+                if self.queued_gain is not None:
+                    self.gain_info.setText(self.gain_info.text() + f" · ожидает ступень {self.queued_gain}")
+                elif step in range(1, 9):
+                    self.gain_buttons[step - 1].setChecked(True)
+                continue
+            if self.receive_mode.currentData() == "fw018" and reply.command == 11:
+                signal, trigger, state = decode_working_snapshot(reply.data)
+                self.show_device_state(state)
+                self.add_working_sample(signal, trigger, state, stamp)
+                snapshot = ThresholdSnapshot(signal, self.last_noise, trigger, None, "UART")
+                self.last_uart_snapshot = snapshot
+                self.show_thresholds(snapshot)
+                self.device_info.setText(f"v0.18 · сигнал {signal} · состояние 0x{state:02X} · CRC HEX: OK")
+                continue
+            if self.receive_mode.currentData() == "fw018" and reply.command == 25:
+                self.last_noise = int.from_bytes(reply.data, "little")
+                self.device_info.setText(f"v0.18 · оценка фона: {self.last_noise} ед. алгоритма · CRC HEX: OK")
                 continue
             if reply.command == command_code(5, self.hex_commands.isChecked()):
                 text = f"Версия ПО: {reply.data[0]}.{reply.data[1]}"
             elif reply.command == command_code(3, self.hex_commands.isChecked()):
                 state = reply.data[0]
-                flags = [(1, "тревога"), (2, "неисправность"), (4, "обрыв кабеля"),
-                         (8, "отключен"), (32, "КЗ кабеля"), (128, "дистанционный контроль")]
-                text = f"Состояние: 0x{state:02X} · " + (", ".join(name for mask, name in flags if state & mask) or "норма")
-                if state & ~0xAF:
-                    text += " · неизвестные биты"
+                self.show_device_state(state)
+                text = f"Состояние: 0x{state:02X} · " + describe_device_state(state)
             else:
                 value = int.from_bytes(reply.data, "little")
                 self.add_device_sample(value, stamp)
@@ -484,17 +901,152 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         if self.reply_parser.rejected != previous:
             self.log_view.appendPlainText("Ответ не распознан или CRC не совпала. Исходные байты сохранены.")
 
-    def add_device_sample(self, value, stamp):
+    def add_working_sample(self, signal, trigger, state, stamp):
         self.times.append(max(0.0, stamp - self.session_start))
-        self.values[0].append(value)
+        self.values[0].append(signal)
+        self.working_thresholds.append(trigger)
+        self.working_states.append(state)
         while self.times and self.times[0] < self.times[-1] - 60:
-            self.times.popleft()
-            self.values[0].popleft()
-        self.buffer_label.setText(f"Прибор · {len(self.times)} измерений · уровень по команде 25")
+            for buffer in (self.times, self.values[0], self.working_thresholds, self.working_states):
+                buffer.popleft()
+        self.buffer_label.setText(f"v0.18 · {len(self.times)} измерений · обработанный сигнал UART")
         if not self.paused:
             self.update_plot()
 
+    def add_device_sample(self, value, stamp):
+        self.times.append(max(0.0, stamp - self.session_start))
+        sample = value if isinstance(value, tuple) else (value,)
+        for buffer, code in zip(self.values, sample):
+            buffer.append(code)
+        if len(sample) == 3:
+            filtered = self.battery_filter.feed(sample[2], stamp)
+            self.filtered_battery_values.append(float("nan") if filtered is None else filtered)
+        while self.times and self.times[0] < self.times[-1] - 60:
+            self.times.popleft()
+            for buffer in self.values[:len(sample)]:
+                buffer.popleft()
+            if len(sample) == 3:
+                self.filtered_battery_values.popleft()
+        kind = "A0–A2" if len(sample) == 3 else "уровень по команде 25"
+        self.buffer_label.setText(f"Прибор · {len(self.times)} измерений · {kind}")
+        if not self.paused:
+            self.update_plot()
+
+    def toggle_thresholds(self, checked):
+        if not checked:
+            if self.threshold_worker is not None:
+                self.threshold_worker.stop()
+                self.read_thresholds.setEnabled(False)
+            self.threshold_info.setText("Пороги: чтение через ST-Link выключено")
+            self.threshold_snapshot = None
+            self.last_swd_snapshot = None
+            if self.buffer_format == "fw018" and self.last_uart_snapshot is not None:
+                self.show_thresholds(self.last_uart_snapshot)
+            self.refresh_threshold_plot()
+            return
+        self.threshold_info.setText("Пороги: подключение к ST-Link через SWD…")
+        self.threshold_reads = 0
+        self.threshold_worker = ThresholdWorker(self, firmware=self.receive_mode.currentData())
+        self.threshold_worker.updated.connect(self.show_thresholds)
+        self.threshold_worker.failed.connect(self.thresholds_failed)
+        self.threshold_worker.finished.connect(self.thresholds_finished)
+        self.threshold_worker.start()
+
+    def show_thresholds(self, snapshot):
+        working = self.buffer_format == "fw018"
+        if snapshot.source == "SWD":
+            self.last_swd_snapshot = snapshot
+            self.last_swd_stamp = time.monotonic()
+        elif (working and self.read_thresholds.isChecked() and self.last_swd_snapshot is not None
+              and time.monotonic() - self.last_swd_stamp < 3):
+            snapshot = ThresholdSnapshot(snapshot.signal, self.last_swd_snapshot.noise,
+                                         self.last_swd_snapshot.trigger, self.last_swd_snapshot.release, "UART + SWD")
+        if snapshot.source.startswith("UART") or self.read_thresholds.isChecked():
+            self.threshold_reads += 1
+            updated = datetime.now().astimezone().strftime("%H:%M:%S")
+            release = f"±{snapshot.release:.4f}" if snapshot.release is not None else "не передаётся UART"
+            noise = f"{snapshot.noise:.4f}" if snapshot.noise is not None else "—"
+            self.threshold_info.setText(
+                f"Пороги {snapshot.source} · срабатывание: ±{snapshot.trigger:.4f} · возврат: {release} · ед. алгоритма\n"
+                f"Обновлено {updated} · чтение №{self.threshold_reads} · "
+                f"сигнал: {snapshot.signal:.2f} · фон: {noise}")
+            self.threshold_snapshot = snapshot
+            self.threshold_times.append(max(0.0, time.monotonic() - self.session_start))
+            self.threshold_signals.append(snapshot.signal)
+            while self.threshold_times and self.threshold_times[0] < self.threshold_times[-1] - 60:
+                self.threshold_times.popleft()
+                self.threshold_signals.popleft()
+            self.refresh_threshold_plot()
+
+    def thresholds_failed(self, message):
+        self.last_swd_snapshot = None
+        if self.buffer_format == "fw018" and self.last_uart_snapshot is not None:
+            self.show_thresholds(self.last_uart_snapshot)
+            return
+        self.threshold_snapshot = None
+        self.threshold_times.clear()
+        self.threshold_signals.clear()
+        self.refresh_threshold_plot()
+        self.threshold_info.setText("Пороги недоступны: " + message + " Повторное чтение автоматически.")
+
+    def sync_threshold_view(self):
+        self.threshold_view.setGeometry(self.plot.getViewBox().sceneBoundingRect())
+        self.threshold_view.linkedViewChanged(self.plot.getViewBox(), self.threshold_view.XAxis)
+
+    def refresh_threshold_plot(self):
+        working = self.buffer_format == "fw018"
+        snapshot = self.threshold_snapshot
+        visible = (snapshot is not None and (snapshot.source.startswith("UART") or self.read_thresholds.isChecked())
+                   and self.source == "device" and self.buffer_format in ("adc_stream", "fw018"))
+        if visible and not working:
+            self.threshold_axis.show()
+        else:
+            self.threshold_axis.hide()
+        self.threshold_view.setVisible(visible)
+        self.threshold_signal_curve.setVisible(not working)
+        items = [self.threshold_signal_curve, *self.threshold_legend_samples]
+        legend_state = (visible, working, snapshot.source if visible else None,
+                        snapshot.release is not None if visible else False)
+        if legend_state != self.threshold_legend_state:
+            legend = self.plot.plotItem.legend
+            names = ("Обработанный CH2 · SWD", "± Срабатывание", "± Возврат")
+            for index, (item, name) in enumerate(zip(items, names)):
+                legend.removeItem(item)
+                if visible and not (index == 0 and working) and not (index == 2 and snapshot.release is None):
+                    legend.addItem(item, name)
+            self.threshold_plot_visible = visible
+            self.threshold_legend_state = legend_state
+            self.refresh_legend()
+            QtCore.QTimer.singleShot(0, self.refresh_legend)
+        if not visible or self.paused:
+            return
+        for sign, trigger, release in zip((1, -1), self.trigger_lines, self.release_lines):
+            trigger.setPos(sign * snapshot.trigger)
+            release.setVisible(snapshot.release is not None)
+            if snapshot.release is not None:
+                release.setPos(sign * snapshot.release)
+        self.threshold_signal_curve.setData(list(self.threshold_times), list(self.threshold_signals))
+        extent = max(1, snapshot.trigger, *(abs(value) for value in self.threshold_signals)) * 1.2
+        self.threshold_view.setYLink(self.plot.getViewBox() if working else None)
+        if working:
+            self.plot.setYRange(-extent, extent, padding=0)
+        self.threshold_view.setYRange(-extent, extent, padding=0)
+        self.sync_threshold_view()
+
+    def thresholds_finished(self):
+        worker = self.threshold_worker
+        self.threshold_worker = None
+        self.read_thresholds.setEnabled(True)
+        if worker is not None:
+            worker.deleteLater()
+
     def closeEvent(self, event):
+        if self.threshold_worker is not None:
+            self.threshold_worker.stop()
+            if not self.threshold_worker.wait(6000):
+                self.threshold_info.setText("Ожидается завершение чтения ST-Link. Повторите закрытие.")
+                event.ignore()
+                return
         if self.worker is not None:
             self.worker.requestInterruption()
             if not self.worker.wait(1500):
@@ -536,6 +1088,8 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         if self.source != "demo":
             self.source = "demo"
             self.clear_data()
+            self.buffer_format = "protocol"
+            self.configure_channels()
             self.badge.setText("●  ДЕМО-РЕЖИМ")
         self.running = not self.running
         if self.running:
@@ -595,6 +1149,12 @@ class TestbenchWindow(QtWidgets.QMainWindow):
             return
         for curve, check in zip(self.curves, self.channel_checks):
             curve.setVisible(check.isEnabled() and check.isChecked())
+        self.plot.showAxis("right", self.buffer_format == "adc_stream" and self.channel_checks[1].isChecked())
+        if self.buffer_format == "adc_stream" and self.channel_checks[2].isChecked():
+            self.battery_axis.show()
+        else:
+            self.battery_axis.hide()
+        self.refresh_threshold_plot()
         if not self.times or self.paused:
             return
         times = np.asarray(self.times)
@@ -602,22 +1162,62 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         right = max(seconds, times[-1])
         left = right - seconds
         start = np.searchsorted(times, left)
-        for curve, buffer in zip(self.curves, self.values):
+        filtered = self.buffer_format == "adc_stream" and self.battery_filter_check.isChecked()
+        buffers = list(self.values)
+        if filtered:
+            buffers[2] = self.filtered_battery_values
+        for curve, buffer in zip(self.curves, buffers):
             if buffer:
                 curve.setData(times[start:], np.asarray(buffer)[start:])
         self.plot.setXRange(left, right, padding=0)
+        if self.buffer_format == "adc_stream" and self.values[1]:
+            code = self.values[1][-1]
+            self.ch2_readout.setText(f"CH2: {code} код / {code * CH2_MV_PER_CODE:.1f} мВ")
+        if self.buffer_format == "adc_stream" and self.values[2]:
+            code = buffers[2][-1]
+            if np.isfinite(code):
+                suffix = " · фильтр" if filtered else " · без фильтра"
+                self.battery_readout.setText(f"CH3: {code * BATTERY_V_PER_CODE:.3f} В" + suffix)
+            else:
+                self.battery_readout.setText(f"CH3: набор {len(self.battery_filter.samples)}/256")
         values = np.asarray(self.values[0])[start:]
         if len(values):
             numbers = [f"{values[-1]:.0f}", f"{values.min():.0f}", f"{values.max():.0f}",
                        f"{np.ptp(values):.0f}", f"{np.std(values):.2f}"]
             for label, number in zip(self.stat_labels, numbers):
-                label.setText(number)
+                label.setText(("Сигнал " if self.buffer_format == "fw018" else "CH1 ") + number)
+        if self.buffer_format == "adc_stream" and self.values[2]:
+            voltage = np.asarray(buffers[2], dtype=float)[start:] * BATTERY_V_PER_CODE
+            voltage = voltage[np.isfinite(voltage)]
+            if len(voltage):
+                numbers = [voltage[-1], voltage.min(), voltage.max(), np.ptp(voltage), np.std(voltage)]
+                for label, number in zip(self.stat_ch3_labels, numbers):
+                    label.setText(f"CH3 {number:.3f} В")
+            else:
+                for label in self.stat_ch3_labels:
+                    label.setText("CH3 — В")
+            for label in self.stat_ch3_labels:
+                label.setToolTip("CH3: " + ("с фильтром, оценки по массивам 256 отсчётов" if filtered else "исходные отсчёты")
+                                 + "; статистика по видимому окну, В")
 
     def autoscale(self):
         self.plot.enableAutoRange(axis="y", enable=True)
         self.update_plot()
 
     def clear_data(self):
+        self.show_device_state(None, "ожидание состояния прибора")
+        self.working_thresholds.clear()
+        self.working_states.clear()
+        self.last_uart_snapshot = None
+        self.last_swd_snapshot = None
+        self.last_noise = None
+        self.battery_filter.reset()
+        self.filtered_battery_values.clear()
+        self.threshold_times.clear()
+        self.threshold_signals.clear()
+        self.threshold_snapshot = None
+        self.threshold_signal_curve.setData([], [])
+        self.refresh_threshold_plot()
         self.times.clear()
         for buffer, curve in zip(self.values, self.curves):
             buffer.clear()
@@ -626,13 +1226,31 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.demo_logged_sample = 0
         self.session_start = time.monotonic()
         for label in self.stat_labels:
-            label.setText("—")
+            label.setText("CH1 —")
+        for label in self.stat_ch3_labels:
+            label.setText("CH3 — В")
         self.buffer_label.setText("Буфер пуст")
+        self.ch2_readout.setText("CH2: — код / — мВ")
+        self.battery_readout.setText("CH3: — В")
         self.plot.setXRange(0, float(self.window_seconds.currentText()), padding=0)
 
     def write_csv(self, path):
         with Path(path).open("w", newline="", encoding="utf-8-sig") as stream:
             writer = csv.writer(stream, delimiter=";")
+            if self.buffer_format == "fw018":
+                writer.writerow(["source", "time_s", "processed_signal", "trigger_threshold", "device_state"])
+                writer.writerows((self.source, f"{stamp:.6f}", signal, trigger, state)
+                                 for stamp, signal, trigger, state in zip(self.times, self.values[0],
+                                                                         self.working_thresholds, self.working_states))
+                return
+            if self.buffer_format == "adc_stream":
+                writer.writerow(["source", "time_s", *ADC_CSV_COLUMNS,
+                                 "a2_trimmed256_code", "battery_trimmed256_V"])
+                writer.writerows((self.source, f"{stamp:.6f}", *sample,
+                                  f"{estimate:.4f}" if np.isfinite(estimate) else "",
+                                  f"{estimate * BATTERY_V_PER_CODE:.6f}" if np.isfinite(estimate) else "")
+                                 for stamp, *sample, estimate in zip(self.times, *self.values[:3], self.filtered_battery_values))
+                return
             writer.writerow(["source", "time_s", "ch1_level_code", "ch1_level_mV"])
             writer.writerows((self.source, f"{stamp:.6f}", value, f"{value * 0.6105:.4f}")
                              for stamp, value in zip(self.times, self.values[0]))
@@ -650,9 +1268,10 @@ class TestbenchWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.warning(self, "Ошибка сохранения", str(error))
 
     def about(self):
-        QtWidgets.QMessageBox.about(self, "О программе", "ADC / DAC Testbench\nВерсия 0.3 — пробный обмен\n\n"
-                                  "CH1 — уровень сигнала (команда 25). CH2–CH8 — резерв.\n"
-                                  "Формат CRC и система счисления команд проверяются по журналу.\n"
+        QtWidgets.QMessageBox.about(self, "О программе", "ADC / DAC Testbench\nВерсия 0.5 — тестовая и рабочая v0.18\n\n"
+                                  "Поток A0–A2: CH1–CH3, 19200 8N1, без CRC.\n"
+                                  "v0.18: сигнал, порог и усиление по UART, 19200 8N1.\n"
+                                  "Протокол 0.0: ручной выбор DEC/HEX и CRC.\n"
                                   "Статистика CH1 рассчитана по видимому временному окну.\nСКО — отклонение от среднего значения.")
 
 

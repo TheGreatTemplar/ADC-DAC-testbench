@@ -41,7 +41,7 @@ if (-not (Test-Path -LiteralPath '.venv\Scripts\python.exe'))
         throw 'Failed to create Python environment.'
     }
 }
-& '.\.venv\Scripts\python.exe' -m pip --version 2>$null
+& '.\.venv\Scripts\python.exe' -c "import sys; from importlib.util import find_spec; sys.exit(0 if find_spec('pip') else 1)"
 if ($LASTEXITCODE -ne 0)
 {
     if (-not $bootstrapPython)
