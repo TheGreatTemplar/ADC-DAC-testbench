@@ -4,6 +4,16 @@ from battery import BatteryBatchFilter
 
 
 class TestBatteryFilter(unittest.TestCase):
+    def test_all_selectable_batch_sizes_trim_outliers_and_hold_between_batches(self):
+        for size in (256, 128, 64, 32):
+            filter_ = BatteryBatchFilter(size)
+            trim = size // 10
+            values = [0] * trim + [2000] * (size - 2 * trim) + [4095] * trim
+            for index, code in enumerate(values[:-1]):
+                self.assertIsNone(filter_.feed(code, index / 57))
+            self.assertEqual(filter_.feed(values[-1], (size - 1) / 57), 2000)
+            self.assertEqual(filter_.feed(1000, size / 57), 2000)
+
     def test_batch_rejects_sparse_dips_and_spikes(self):
         filter_ = BatteryBatchFilter()
         codes = [3000] * 23 + [3700] * 210 + [4000] * 23

@@ -1,0 +1,9 @@
+-r requirements-portable.txt
+PyInstaller==5.13.2
+pyinstaller-hooks-contrib==2023.8
+setuptools==68.2.2
+importlib-metadata==6.8.0
+zipp==3.17.0
+altgraph==0.17.5
+pefile==2024.8.26
+pywin32-ctypes==0.2.3

@@ -13,10 +13,14 @@ class SerialWorker(QtCore.QThread):
     transmitted = QtCore.Signal(bytes, float)
     failed = QtCore.Signal(str)
 
-    def __init__(self, port, baudrate, parent=None):
+    def __init__(self, port, baudrate, parent=None, *, bytesize=serial.EIGHTBITS,
+                 parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE):
         super().__init__(parent)
         self.port_name = port
         self.baudrate = baudrate
+        self.bytesize = bytesize
+        self.parity = parity
+        self.stopbits = stopbits
         self.outgoing = queue.Queue()
 
     def send(self, data):
@@ -26,8 +30,8 @@ class SerialWorker(QtCore.QThread):
         connection = None
         try:
             connection = serial.serial_for_url(self.port_name, baudrate=self.baudrate,
-                                               bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
-                                               stopbits=serial.STOPBITS_ONE, timeout=0.05,
+                                               bytesize=self.bytesize, parity=self.parity,
+                                               stopbits=self.stopbits, timeout=0.05,
                                                write_timeout=0.5, xonxoff=False, rtscts=False,
                                                dsrdtr=False, do_not_open=True)
             connection.dtr = False

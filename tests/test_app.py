@@ -3,16 +3,22 @@ import io
 import os
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
-from app import CHANNEL_COUNT, QtWidgets, TestbenchWindow
+from app import CHANNEL_COUNT, QtWidgets, TestbenchWindow, application_directory
 
 
 class TestTestbench(unittest.TestCase):
+    def test_frozen_capture_directory_is_next_to_executable(self):
+        with patch("app.sys.frozen", True, create=True), \
+                patch("app.sys.executable", str(Path.cwd() / "dist" / "ADC-DAC-Testbench.exe")):
+            self.assertEqual(application_directory(), Path.cwd() / "dist")
+
     @classmethod
     def setUpClass(cls):
         cls.application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -111,8 +117,9 @@ class TestTestbench(unittest.TestCase):
             open_file.return_value.__enter__.return_value = stream
             window.write_csv("unused.csv")
         rows = list(csv.reader(io.StringIO(stream.getvalue()), delimiter=";"))
-        self.assertEqual(rows[0], ["source", "time_s", "processed_signal", "trigger_threshold", "device_state"])
-        self.assertEqual(rows[1][2:], ["-17", "300", "1"])
+        self.assertEqual(rows[0], ["source", "time_s", "processed_signal", "trigger_threshold", "device_state",
+                                  "processed_signal_trimmed256"])
+        self.assertEqual(rows[1][2:5], ["-17", "300", "1"])
 
     def test_gain_write_is_explicit_and_read_back_even_without_ack(self):
         window = self.working_window()
@@ -254,9 +261,9 @@ class TestTestbench(unittest.TestCase):
         rows = list(csv.reader(io.StringIO(stream.getvalue()), delimiter=";"))
         self.assertEqual(len(rows), 41)
         self.assertEqual(rows[0][-1], "ch1_level_mV")
-        self.assertEqual(len(rows[0]), 4)
+        self.assertEqual(len(rows[0]), 6)
         self.assertEqual(int(rows[1][2]), window.values[0][0])
-        self.assertAlmostEqual(float(rows[1][3]), window.values[0][0] * 0.6105, places=4)
+        self.assertAlmostEqual(float(rows[1][-1]), window.values[0][0] * 0.6105, places=4)
 
     def test_buffer_is_bounded(self):
         window = self.window
@@ -287,6 +294,13 @@ class TestTestbench(unittest.TestCase):
         self.assertFalse(window.poll.isChecked())
 
     def test_defaults(self):
+        self.assertEqual(self.window.window_seconds, 60)
+        self.assertEqual([button.text() for button in self.window.window_buttons], ["5", "10", "30", "60"])
+        self.assertEqual(self.window.window_button_group.checkedId(), 60)
+        self.window.window_buttons[0].click()
+        self.assertEqual(self.window.window_seconds, 5)
+        self.assertEqual(sum(button.isChecked() for button in self.window.window_buttons), 1)
+        self.assertEqual(self.window.serial_format(), "8N1")
         self.window.receive_mode.setCurrentIndex(self.window.receive_mode.findData("adc_stream"))
         self.assertEqual(self.window.baud.currentText(), "19200")
         self.assertFalse(self.window.crc_mode.isEnabled())
@@ -320,10 +334,143 @@ class TestTestbench(unittest.TestCase):
             window.write_csv("unused.csv")
         rows = list(csv.reader(io.StringIO(stream.getvalue()), delimiter=";"))
         self.assertEqual(rows[1][-2:], ["", ""])
-        self.assertEqual(rows[-1][4:6], ["4000", "3700.0000"])
+        self.assertEqual(rows[-1][4], "4000")
+        self.assertEqual(rows[-1][rows[0].index("a2_trimmed256_code")], "3700.0000")
         window.clear_data()
         self.assertFalse(window.filtered_battery_values)
         self.assertIsNone(window.battery_filter.value)
+
+    def test_ch2_and_ch3_filter_sizes_are_independent_and_recompute_raw_buffer(self):
+        window = self.window
+        window.source = "device"
+        window.buffer_format = "adc_stream"
+        window.configure_channels(True)
+        window.alarm_filter_check.setChecked(True)
+        window.battery_filter_check.setChecked(True)
+        window.filter_size_groups[1].button(32).click()
+        ch2 = [0] * 3 + [1800] * 26 + [4095] * 3
+        ch3 = [1000] * 3 + [3000] * 26 + [4095] * 3
+        stamp = window.session_start
+        for index, (alarm, battery) in enumerate(zip(ch2, ch3)):
+            window.add_device_sample((600, alarm, battery), stamp + index / 57)
+        self.assertEqual(window.curves[1].yData[-1], 1800)
+        self.assertIn("1800.0 код", window.ch2_readout.text())
+        self.assertIn("набор 32/256", window.battery_readout.text())
+        self.assertEqual(window.stat_ch2_labels[0].text(), "CH2 1800.0")
+        window.alarm_filter_check.setChecked(False)
+        self.assertEqual(window.curves[1].yData[-1], 4095)
+        self.assertEqual(window.stat_ch2_labels[0].text(), "CH2 4095")
+        window.alarm_filter_check.setChecked(True)
+        window.filter_size_groups[2].button(32).click()
+        self.assertEqual(window.curves[2].yData[-1], 3000)
+        self.assertEqual(window.curves[1].yData[-1], 1800)
+        window.filter_size_groups[1].button(64).click()
+        self.assertTrue(np.isnan(window.curves[1].yData[-1]))
+        self.assertIn("набор 32/64", window.ch2_readout.text())
+        self.assertEqual(window.stat_ch2_labels[0].text(), "CH2 —")
+        self.assertEqual(window.curves[2].yData[-1], 3000)
+        for index in range(32, 64):
+            window.add_device_sample((600, 1800, 3000), stamp + index / 57)
+        self.assertEqual(window.curves[1].yData[-1], 1800)
+        self.assertEqual(list(window.values[1])[:32], ch2)
+        self.assertEqual(list(window.values[2])[:32], ch3)
+        output = io.StringIO()
+        with patch("app.Path.open") as open_file:
+            open_file.return_value.__enter__.return_value = output
+            window.write_csv("unused.csv")
+        rows = list(csv.reader(io.StringIO(output.getvalue()), delimiter=";"))
+        self.assertEqual(len(rows), 65)
+        self.assertIn("a1_trimmed64_code", rows[0])
+        self.assertIn("a2_trimmed32_code", rows[0])
+        self.assertEqual(rows[-1][rows[0].index("a1_trimmed64_code")], "1800.0000")
+        self.assertEqual(rows[-1][rows[0].index("a2_trimmed32_code")], "3000.0000")
+
+    def test_all_eight_filters_process_and_export_independently(self):
+        window = self.window
+        self.assertEqual([window.sidebar_tabs.tabText(index) for index in range(4)],
+                         ["Порт", "Протокол", "Каналы", "Фильтры"])
+        self.assertEqual(len(window.filter_checks), 8)
+        window.source = "device"
+        window.buffer_format = "adc_stream"
+        window.configure_channels(True, channel_count=8)
+        window.set_pause(True)
+        for channel, check in enumerate(window.filter_checks):
+            self.assertTrue(check.isEnabled())
+            check.setChecked(True)
+            window.filter_size_groups[channel].button((32, 64, 128, 256)[channel % 4]).click()
+        stamp = window.session_start
+        for index in range(256):
+            sample = tuple(4095 if index == 255 else 1000 + channel * 100 for channel in range(8))
+            window.add_device_sample(sample, stamp + index / 57)
+        window.set_pause(False)
+        for channel, curve in enumerate(window.curves):
+            self.assertEqual(curve.yData[-1], 1000 + channel * 100)
+            self.assertEqual(window.values[channel][-1], 4095)
+        self.assertEqual(window.stat_labels[0].text(), "CH1 1000.0")
+        window.filter_checks[7].setChecked(False)
+        self.assertEqual(window.curves[7].yData[-1], 4095)
+        self.assertEqual(window.curves[6].yData[-1], 1600)
+        output = io.StringIO()
+        with patch("app.Path.open") as open_file:
+            open_file.return_value.__enter__.return_value = output
+            window.write_csv("unused.csv")
+        rows = list(csv.reader(io.StringIO(output.getvalue()), delimiter=";"))
+        self.assertEqual(len(rows), 257)
+        self.assertEqual(rows[-1][rows[0].index("ch8_code")], "4095")
+        self.assertEqual(rows[-1][rows[0].index("ch8_trimmed256_code")], "1700.0000")
+        window.add_device_sample(tuple(range(8)), stamp + 65)
+        self.assertEqual(len(window.times), 1)
+        self.assertTrue(all(len(buffer) == 1 for buffer in window.filtered_values))
+        self.assertTrue(all(filter_.value is None for filter_ in window.channel_filters))
+        window.clear_data()
+        self.assertTrue(all(not buffer for buffer in window.filtered_values))
+        window.buffer_format = "fw018"
+        window.configure_channels()
+        self.assertEqual([check.isEnabled() for check in window.filter_checks], [True] + [False] * 7)
+
+    def test_working_signal_filter_changes_display_but_preserves_uart_data_in_csv(self):
+        window = self.working_window()
+        window.set_filter_size(0, 32)
+        window.filter_checks[0].setChecked(True)
+        window.set_pause(True)
+        stamp = window.session_start
+        for index in range(32):
+            signal = -1000 if index == 31 else -17
+            data = signal.to_bytes(2, "little", signed=True) + b"\x35\x00\x00"
+            packet = b"!0B" + data.hex().upper().encode("ascii") + f"{(11 + sum(data)) & 255:02X}".encode("ascii") + b"\r"
+            window.receive_data(packet, stamp + index / 5)
+        window.set_pause(False)
+        self.assertEqual(window.curves[0].yData[-1], -17)
+        self.assertEqual(window.stat_labels[0].text(), "Сигнал -17.0")
+        output = io.StringIO()
+        with patch("app.Path.open") as open_file:
+            open_file.return_value.__enter__.return_value = output
+            window.write_csv("unused.csv")
+        rows = list(csv.reader(io.StringIO(output.getvalue()), delimiter=";"))
+        self.assertEqual(rows[-1][2], "-1000")
+        self.assertEqual(rows[0][-1], "processed_signal_trimmed32")
+        self.assertEqual(rows[-1][-1], "-17.000000")
+
+    def test_ch2_statistics_use_visible_raw_samples_and_reset_with_buffer(self):
+        window = self.window
+        window.source = "device"
+        window.buffer_format = "adc_stream"
+        window.configure_channels(True)
+        window.set_window_seconds(5)
+        window.set_pause(True)
+        for elapsed, code in [(1, 1000), (10, 1200), (11, 800)]:
+            window.add_device_sample((600, code, 3000), window.session_start + elapsed)
+        window.set_pause(False)
+        expected = ["CH2 800", "CH2 800", "CH2 1200", "CH2 400", "CH2 200.00"]
+        self.assertEqual([label.text() for label in window.stat_ch2_labels], expected)
+        self.assertTrue(all(label.isVisible() for label in window.stat_ch2_labels))
+        window.battery_filter_check.setChecked(True)
+        self.assertEqual([label.text() for label in window.stat_ch2_labels], expected)
+        window.clear_data()
+        self.assertEqual([label.text() for label in window.stat_ch2_labels], ["CH2 —"] * 5)
+        window.buffer_format = "fw018"
+        window.configure_channels()
+        self.assertTrue(all(not label.isVisible() for label in window.stat_ch2_labels))
 
     def test_threshold_refresh_is_visible_when_values_are_unchanged(self):
         from swd import ThresholdSnapshot
@@ -425,6 +572,8 @@ class TestTestbench(unittest.TestCase):
         rows = list(csv.reader(io.StringIO(stream.getvalue()), delimiter=";"))
         self.assertEqual(rows[0], ["source", "time_s", "a0_kche_integrity_code",
                                   "a1_alarm_processing_code", "a2_battery_supply_code",
+                                  "a0_trimmed256_code",
+                                  "a1_trimmed256_code", "alarm_trimmed256_mV",
                                   "a2_trimmed256_code", "battery_trimmed256_V"])
         self.assertEqual(rows[2][2:5], ["2", "2049", "4094"])
         window.set_pause(True)
@@ -528,6 +677,27 @@ class TestTestbench(unittest.TestCase):
             time.sleep(0.005)
         self.assertIsNone(window.worker)
         self.assertTrue(capture.was_closed)
+
+    def test_port_format_is_used_locked_and_saved_in_capture(self):
+        window = self.window
+        window.port.addItem("Selected port", "COM99")
+        window.port.setCurrentIndex(window.port.count() - 1)
+        window.data_bits.setCurrentIndex(window.data_bits.findData(7))
+        window.parity.setCurrentIndex(window.parity.findData("E"))
+        window.stop_bits.setCurrentIndex(window.stop_bits.findData(2))
+        capture = io.StringIO()
+        with patch("app.SerialWorker") as worker_class, patch("app.Path.open", return_value=capture):
+            window.toggle_connection()
+            try:
+                self.assertEqual(worker_class.call_args.kwargs, dict(bytesize=7, parity="E", stopbits=2))
+                self.assertTrue(all(not widget.isEnabled() for widget in (window.data_bits, window.parity, window.stop_bits)))
+                window.record("OPEN", b"", time.monotonic())
+                self.assertIn('"serial_format": "7E2"', capture.getvalue())
+                self.assertIn('"data_bits": 7', capture.getvalue())
+                self.assertIn('"parity": "E"', capture.getvalue())
+            finally:
+                window.device_finished()
+        self.assertTrue(all(widget.isEnabled() for widget in (window.data_bits, window.parity, window.stop_bits)))
 
 
 if __name__ == "__main__":

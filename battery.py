@@ -1,4 +1,4 @@
-"""Batch estimate for an occasional battery measurement; raw samples stay intact."""
+"""Trimmed batch estimate for ADC channels; raw samples stay intact."""
 
 
 class BatteryBatchFilter:

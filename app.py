@@ -30,6 +30,11 @@ BATTERY_R_BOTTOM_KOHM = 42.2
 BATTERY_V_PER_CODE = BATTERY_VREF_V / 4095 * (BATTERY_R_TOP_KOHM + BATTERY_R_BOTTOM_KOHM) / BATTERY_R_BOTTOM_KOHM
 
 
+def application_directory():
+    # One-file bundles unpack __file__ to a temporary directory.
+    return Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
+
+
 class Ch2MillivoltAxis(pg.AxisItem):
     """Secondary labels for the shared ADC-code coordinate system."""
 
@@ -86,8 +91,12 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.rng = np.random.default_rng()
         self.times = deque(maxlen=60000)
         self.values = [deque(maxlen=60000) for _ in range(CHANNEL_COUNT)]
-        self.battery_filter = BatteryBatchFilter()
-        self.filtered_battery_values = deque(maxlen=60000)
+        self.channel_filters = [BatteryBatchFilter() for _ in range(CHANNEL_COUNT)]
+        self.filtered_values = [deque(maxlen=60000) for _ in range(CHANNEL_COUNT)]
+        self.battery_filter = self.channel_filters[2]
+        self.filtered_battery_values = self.filtered_values[2]
+        self.alarm_filter = self.channel_filters[1]
+        self.filtered_alarm_values = self.filtered_values[1]
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(40)
         self.timer.timeout.connect(self.tick)
@@ -156,10 +165,13 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.sidebar_tabs.addTab(port_page, "Порт")
         self.sidebar_tabs.addTab(protocol_page, "Протокол")
         self.sidebar_tabs.addTab(sidebar, "Каналы")
+        filters_page = QtWidgets.QWidget()
+        filters_layout = QtWidgets.QVBoxLayout(filters_page)
+        self.sidebar_tabs.addTab(filters_page, "Фильтры")
         body.addWidget(self.sidebar_tabs)
         connection = QtWidgets.QGroupBox("ПОДКЛЮЧЕНИЕ")
         form = QtWidgets.QFormLayout(connection)
-        form.setSpacing(10)
+        form.setSpacing(6)
         self.port = QtWidgets.QComboBox()
         self.port.setMinimumWidth(130)
         form.addRow("COM-порт", self.port)
@@ -177,9 +189,20 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.receive_mode.setToolTip("v0.18: сигнал и порог по UART. Тестовая: поток A0/A1/A2 без CRC.")
         self.receive_mode.currentIndexChanged.connect(self.change_receive_mode)
         form.addRow("Формат", self.receive_mode)
-        format_label = QtWidgets.QLabel("8 бит · без чётности · 1 стоп-бит")
-        format_label.setObjectName("muted")
-        form.addRow(format_label)
+        self.data_bits = QtWidgets.QComboBox()
+        for bits in (5, 6, 7, 8):
+            self.data_bits.addItem(str(bits), bits)
+        self.data_bits.setCurrentIndex(self.data_bits.findData(8))
+        form.addRow("Биты данных", self.data_bits)
+        self.parity = QtWidgets.QComboBox()
+        for label, value in [("Нет", "N"), ("Чётная", "E"), ("Нечётная", "O"),
+                             ("Маркер (1)", "M"), ("Пробел (0)", "S")]:
+            self.parity.addItem(label, value)
+        form.addRow("Чётность", self.parity)
+        self.stop_bits = QtWidgets.QComboBox()
+        for bits in (1, 1.5, 2):
+            self.stop_bits.addItem(f"{bits:g}", bits)
+        form.addRow("Стоп-биты", self.stop_bits)
         refresh = QtWidgets.QPushButton("Обновить список портов")
         refresh.clicked.connect(self.refresh_ports)
         form.addRow(refresh)
@@ -270,11 +293,64 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         side.addWidget(channels)
         acquisition = QtWidgets.QGroupBox("ОТОБРАЖЕНИЕ")
         acquisition_form = QtWidgets.QFormLayout(acquisition)
-        self.window_seconds = QtWidgets.QComboBox()
-        self.window_seconds.addItems(["2", "5", "10", "30", "60"])
-        self.window_seconds.setCurrentText("10")
-        self.window_seconds.currentTextChanged.connect(self.update_plot)
-        acquisition_form.addRow("Окно, с", self.window_seconds)
+        filter_group = QtWidgets.QGroupBox("ФИЛЬТРЫ КАНАЛОВ")
+        filter_form = QtWidgets.QFormLayout(filter_group)
+        filter_form.setSpacing(6)
+        self.filter_checks = []
+        self.filter_size_groups = {}
+        self.filter_size_widgets = {}
+        for channel in range(CHANNEL_COUNT):
+            check = QtWidgets.QCheckBox(f"CH{channel + 1}")
+            check.setChecked(channel == 2)
+            check.setStyleSheet(f"QCheckBox {{ color:{CHANNEL_COLORS[channel]}; font-weight:600; }}")
+            self.filter_checks.append(check)
+            check.setToolTip("Отбросить по 10% крайних значений, усреднить остальные. Размер — в отсчётах. Исходные данные сохраняются.")
+            check.toggled.connect(self.update_plot)
+            group = QtWidgets.QButtonGroup(self)
+            group.setExclusive(True)
+            field = QtWidgets.QWidget()
+            row = QtWidgets.QHBoxLayout(field)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(2)
+            for size in (256, 128, 64, 32):
+                button = QtWidgets.QPushButton(str(size))
+                button.setCheckable(True)
+                button.setChecked(size == 256)
+                button.setStyleSheet("QPushButton { padding:6px 3px; } QPushButton:checked { background:#167e85; border-color:#45d7d0; color:white; }"
+                                    "QPushButton:checked:disabled { background:#233848; border-color:#354862; color:#738197; }")
+                button.setToolTip("Размер массива; при смене фильтр пересчитывается по исходным данным буфера")
+                button.clicked.connect(lambda checked=False, ch=channel, count=size: self.set_filter_size(ch, count))
+                group.addButton(button, size)
+                row.addWidget(button)
+            self.filter_size_groups[channel] = group
+            self.filter_size_widgets[channel] = field
+            filter_form.addRow(check, field)
+        self.alarm_filter_check = self.filter_checks[1]
+        self.battery_filter_check = self.filter_checks[2]
+        filters_layout.addWidget(filter_group)
+        filter_note = QtWidgets.QLabel("Галочка — включить фильтр. Кнопки — размер массива в отсчётах.\n"
+                                      "Усреднение с отбрасыванием по 10% крайних значений. Исходные данные сохраняются.\n"
+                                      "Неактивные каналы не передаются выбранным источником.")
+        filter_note.setWordWrap(True)
+        filter_note.setObjectName("muted")
+        filters_layout.addWidget(filter_note)
+        filters_layout.addStretch()
+        self.window_seconds = 60
+        self.window_button_group = QtWidgets.QButtonGroup(self)
+        self.window_button_group.setExclusive(True)
+        self.window_buttons = []
+        window_row = QtWidgets.QHBoxLayout()
+        window_row.setSpacing(3)
+        for seconds in (5, 10, 30, 60):
+            button = QtWidgets.QPushButton(str(seconds))
+            button.setCheckable(True)
+            button.setChecked(seconds == self.window_seconds)
+            button.setStyleSheet("QPushButton { padding:6px 4px; } QPushButton:checked { background:#167e85; border-color:#45d7d0; color:white; }")
+            button.clicked.connect(lambda checked=False, value=seconds: self.set_window_seconds(value))
+            self.window_button_group.addButton(button, seconds)
+            self.window_buttons.append(button)
+            window_row.addWidget(button)
+        acquisition_form.addRow("Окно, с", window_row)
         acquisition_form.addRow(QtWidgets.QLabel("Время прибора — по приёму ПК\nБуфер: последние 60 секунд"))
         side.addWidget(acquisition)
         dac_note = QtWidgets.QLabel("ЦАП\nУправление добавим после\nсогласования команд прибора.")
@@ -282,7 +358,7 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         side.addWidget(dac_note)
         side.addStretch()
         main = QtWidgets.QVBoxLayout()
-        main.setSpacing(14)
+        main.setSpacing(4)
         body.addLayout(main, 1)
         toolbar = QtWidgets.QHBoxLayout()
         self.start = QtWidgets.QPushButton("Запустить демо")
@@ -299,12 +375,6 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         clear = QtWidgets.QPushButton("Очистить")
         clear.clicked.connect(self.clear_data)
         toolbar.addWidget(clear)
-        self.battery_filter_check = QtWidgets.QCheckBox("Фильтр CH3")
-        self.battery_filter_check.setChecked(True)
-        self.battery_filter_check.setEnabled(False)
-        self.battery_filter_check.setToolTip("Массив 256 отсчётов: отбросить 10% снизу и сверху, усреднить оставшиеся. Новый результат примерно раз в 4,5 с.")
-        self.battery_filter_check.toggled.connect(self.update_plot)
-        toolbar.addWidget(self.battery_filter_check)
         toolbar.addStretch()
         self.battery_readout = QtWidgets.QLabel("CH3: — В")
         self.battery_readout.setStyleSheet(f"color:{CHANNEL_COLORS[2]}; font-size:18px; font-weight:600")
@@ -317,10 +387,12 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.ch2_mv_axis.setLabel("CH2, мВ · опора 3,3 В", color=CHANNEL_COLORS[1])
         self.ch2_mv_axis.setTextPen(CHANNEL_COLORS[1])
         self.ch2_mv_axis.enableAutoSIPrefix(False)
-        self.ch2_mv_axis.setWidth(75)
+        self.ch2_mv_axis.setWidth(60)
+        self.ch2_mv_axis.setStyle(tickTextOffset=3)
         self.plot = pg.PlotWidget(background="#101b2b", axisItems={"right": self.ch2_mv_axis})
         self.plot.showAxis("right", False)
         self.plot.setMinimumHeight(150)
+        self.plot.plotItem.layout.setHorizontalSpacing(1)
         self.plot.setLabel("left", "Уровень CH1, код")
         self.plot.setLabel("bottom", "Время", units="s")
         self.plot.showGrid(x=True, y=True, alpha=0.15)
@@ -328,7 +400,7 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         legend.setColumnCount(2)
         legend.setZValue(1000)
         self.plot.setYRange(1950, 2370)
-        self.plot.setXRange(0, 10, padding=0)
+        self.plot.setXRange(0, self.window_seconds, padding=0)
         self.plot.setClipToView(True)
         self.plot.setDownsampling(auto=True, mode="peak")
         self.curves = [self.plot.plot(pen=pg.mkPen(color, width=1.5), name="CH1" if index == 0 else None)
@@ -339,7 +411,8 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.battery_axis.setLabel("CH3 · питание, В", color=CHANNEL_COLORS[2])
         self.battery_axis.setTextPen(CHANNEL_COLORS[2])
         self.battery_axis.enableAutoSIPrefix(False)
-        self.battery_axis.setWidth(70)
+        self.battery_axis.setWidth(58)
+        self.battery_axis.setStyle(tickTextOffset=3)
         self.battery_axis.linkToView(self.plot.getViewBox())
         self.plot.plotItem.layout.addItem(self.battery_axis, 2, 3)
         self.battery_axis.hide()
@@ -347,7 +420,8 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.threshold_axis.setLabel("Обработка / пороги, ед.", color="#e591c8")
         self.threshold_axis.setTextPen("#e591c8")
         self.threshold_axis.enableAutoSIPrefix(False)
-        self.threshold_axis.setWidth(85)
+        self.threshold_axis.setWidth(50)
+        self.threshold_axis.setStyle(tickTextOffset=3)
         self.plot.plotItem.layout.addItem(self.threshold_axis, 2, 4)
         self.threshold_view = pg.ViewBox()
         self.plot.scene().addItem(self.threshold_view)
@@ -367,11 +441,12 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.plot.getViewBox().sigResized.connect(self.sync_threshold_view)
         self.sync_threshold_view()
         main.addWidget(self.plot, 1)
-        hint = QtWidgets.QLabel("Колесо мыши — масштаб · перетаскивание — перемещение · правая кнопка — меню графика")
-        hint.setObjectName("muted")
-        main.addWidget(hint)
+        self.plot.setToolTip("Колесо мыши — масштаб · перетаскивание — перемещение · правая кнопка — меню графика")
         stats = QtWidgets.QHBoxLayout()
+        stats.setSpacing(6)
+        self.stat_frames = []
         self.stat_labels = []
+        self.stat_ch2_labels = []
         self.stat_ch3_labels = []
         for caption in ["ТЕКУЩЕЕ", "МИНИМУМ", "МАКСИМУМ", "РАЗМАХ P–P", "СКО"]:
             frame = QtWidgets.QFrame()
@@ -386,19 +461,26 @@ class TestbenchWindow(QtWidgets.QMainWindow):
             value = QtWidgets.QLabel("CH1 —")
             value.setStyleSheet(f"font-size:12px; font-weight:600; color:{CHANNEL_COLORS[0]}")
             value.setToolTip("CH1: коды АЦП по видимому окну")
+            alarm_value = QtWidgets.QLabel("CH2 —")
+            alarm_value.setStyleSheet(f"font-size:12px; font-weight:600; color:{CHANNEL_COLORS[1]}")
+            alarm_value.setToolTip("CH2: исходные коды АЦП по видимому окну")
+            alarm_value.setVisible(False)
             battery_value = QtWidgets.QLabel("CH3 — В")
             battery_value.setStyleSheet(f"font-size:12px; font-weight:600; color:{CHANNEL_COLORS[2]}")
             battery_value.setToolTip("CH3: напряжение питания в вольтах по видимому окну")
             battery_value.setVisible(False)
-            numbers = QtWidgets.QHBoxLayout()
-            numbers.setSpacing(6)
-            numbers.addWidget(value)
-            numbers.addStretch()
-            numbers.addWidget(battery_value)
+            numbers = QtWidgets.QGridLayout()
+            numbers.setHorizontalSpacing(6)
+            numbers.setVerticalSpacing(0)
+            numbers.addWidget(value, 0, 0)
+            numbers.addWidget(alarm_value, 0, 1)
+            numbers.addWidget(battery_value, 1, 0, 1, 2)
             box.addWidget(label)
             box.addLayout(numbers)
             stats.addWidget(frame)
+            self.stat_frames.append(frame)
             self.stat_labels.append(value)
+            self.stat_ch2_labels.append(alarm_value)
             self.stat_ch3_labels.append(battery_value)
         main.addLayout(stats)
         footer = QtWidgets.QHBoxLayout()
@@ -410,9 +492,6 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.ch2_readout.setStyleSheet(f"color:{CHANNEL_COLORS[1]}")
         self.ch2_readout.setVisible(False)
         footer.addWidget(self.ch2_readout)
-        save = QtWidgets.QPushButton("Сохранить буфер CSV…")
-        save.clicked.connect(self.export_csv)
-        footer.addWidget(save)
         main.addLayout(footer)
         self.device_info = QtWidgets.QLabel("Прибор не подключён · поток A0–A2: 19200 8N1, без CRC")
         self.device_info.setWordWrap(True)
@@ -433,6 +512,9 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.log_path = QtWidgets.QLabel("Файл журнала создаётся при подключении в папке captures.")
         self.log_path.setWordWrap(True)
         log_header.addWidget(self.log_path, 1)
+        save = QtWidgets.QPushButton("Сохранить буфер CSV…")
+        save.clicked.connect(self.export_csv)
+        log_header.addWidget(save)
         clear_log = QtWidgets.QPushButton("Очистить экран журнала")
         clear_log.setToolTip("Очищает только экран. Файл обмена с прибором сохраняется.")
         clear_log.clicked.connect(lambda: self.log_view.clear())
@@ -452,6 +534,36 @@ class TestbenchWindow(QtWidgets.QMainWindow):
     def show_log(self):
         self.log_view.setFocus()
         self.log_view.moveCursor(QtGui.QTextCursor.End)
+
+    def set_window_seconds(self, seconds):
+        if seconds not in (5, 10, 30, 60):
+            return
+        self.window_seconds = seconds
+        self.window_button_group.button(seconds).setChecked(True)
+        if not self.times:
+            self.plot.setXRange(0, seconds, padding=0)
+        self.update_plot()
+
+    def serial_format(self):
+        return f"{self.data_bits.currentData()}{self.parity.currentData()}{self.stop_bits.currentData():g}"
+
+    def set_filter_size(self, channel, size):
+        if channel not in range(CHANNEL_COUNT) or size not in (256, 128, 64, 32):
+            return
+        filter_ = self.channel_filters[channel]
+        if filter_.size == size:
+            return
+        filter_.size = size
+        filter_.reset()
+        estimates = self.filtered_values[channel]
+        estimates.clear()
+        for elapsed, code in zip(self.times, self.values[channel]):
+            value = filter_.feed(code, self.session_start + elapsed)
+            estimates.append(float("nan") if value is None else value)
+        self.filter_size_groups[channel].button(size).setChecked(True)
+        if self.log_file is not None:
+            self.record("CONFIG", b"", time.monotonic())
+        self.update_plot()
 
     def reset_protocol(self, *_):
         if not hasattr(self, "hex_commands") or not hasattr(self, "crc_mode"):
@@ -496,25 +608,28 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.gain_info.setText("Текущая ступень: —" if working else "В тестовой прошивке UART-команда недоступна")
         self.set_request_controls()
 
-    def configure_channels(self, stream=False):
+    def configure_channels(self, stream=False, channel_count=None):
         self.threshold_plot_visible = False
         self.threshold_legend_state = None
         self.plot.plotItem.legend.clear()
         working = self.buffer_format == "fw018" and self.source == "device"
         self.curves[0].setPen(pg.mkPen(CHANNEL_COLORS[1] if working else CHANNEL_COLORS[0], width=1.5))
         short_names = ("КЧЭ", "Тревога", "Батарея")
+        count = channel_count if channel_count is not None else (3 if stream else 1)
+        if not 1 <= count <= CHANNEL_COUNT:
+            raise ValueError("Channel count must be between 1 and 8")
         for index, (check, curve) in enumerate(zip(self.channel_checks, self.curves)):
-            enabled = index < (3 if stream else 1)
-            label = f"CH{index + 1}" + (f" · {short_names[index]}" if stream and enabled else "")
+            enabled = index < count
+            label = f"CH{index + 1}" + (f" · {short_names[index]}" if stream and enabled and index < 3 else "")
             if working and index == 0:
                 label = "Сигнал · обработка"
             check.setText(label)
             check.setEnabled(enabled)
             check.setChecked(enabled)
-            check.setToolTip(f"A{index}: {ADC_CHANNEL_NAMES[index]} · код АЦП" if stream and enabled else
+            check.setToolTip(f"A{index}: {ADC_CHANNEL_NAMES[index]} · код АЦП" if stream and enabled and index < 3 else
                              "Текущий уровень прибора" if index == 0 else "Резерв")
             if enabled:
-                legend_label = f"CH{index + 1} / A{index} · {ADC_CHANNEL_NAMES[index]}" if stream else label
+                legend_label = f"CH{index + 1} / A{index} · {ADC_CHANNEL_NAMES[index]}" if stream and index < 3 else label
                 self.plot.plotItem.legend.addItem(curve, legend_label)
         self.channel_note.setText("\n".join(f"CH{index + 1} / A{index}: {name}"
                                             for index, name in enumerate(ADC_CHANNEL_NAMES)) if stream else
@@ -526,8 +641,14 @@ class TestbenchWindow(QtWidgets.QMainWindow):
             self.plot.setLabel("left", "Обработка, ед.")
         self.ch2_readout.setVisible(stream)
         self.battery_readout.setVisible(stream)
-        self.battery_filter_check.setEnabled(stream)
-        self.battery_filter_check.setVisible(stream)
+        for channel, check in enumerate(self.filter_checks):
+            enabled = self.channel_checks[channel].isEnabled()
+            check.setEnabled(enabled)
+            self.filter_size_widgets[channel].setEnabled(enabled)
+        for frame in self.stat_frames:
+            frame.setFixedHeight(48 if stream else 36)
+        for label in self.stat_ch2_labels:
+            label.setVisible(stream)
         for label in self.stat_ch3_labels:
             label.setVisible(stream)
         self.show_device_state(None, "тестовая прошивка не передаёт состояние кабеля" if stream else
@@ -596,7 +717,7 @@ class TestbenchWindow(QtWidgets.QMainWindow):
             return
         if self.running:
             self.toggle_run()
-        directory = Path(__file__).resolve().parent / "captures"
+        directory = application_directory() / "captures"
         filename = "exchange_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f") + ".jsonl"
         try:
             directory.mkdir(exist_ok=True)
@@ -623,7 +744,9 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         if self.buffer_format == "fw018":
             self.badge.setText("●  ПРИБОР · v0.18 · UART")
         self.plot.enableAutoRange(axis="y", enable=True)
-        self.worker = SerialWorker(port, int(self.baud.currentText()), self)
+        self.worker = SerialWorker(port, int(self.baud.currentText()), self,
+                                   bytesize=self.data_bits.currentData(), parity=self.parity.currentData(),
+                                   stopbits=self.stop_bits.currentData())
         self.worker.opened.connect(self.device_opened)
         self.worker.received.connect(self.receive_data)
         self.worker.transmitted.connect(self.data_transmitted)
@@ -631,10 +754,12 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.worker.finished.connect(self.device_finished)
         self.port.setEnabled(False)
         self.baud.setEnabled(False)
+        for widget in (self.data_bits, self.parity, self.stop_bits):
+            widget.setEnabled(False)
         self.receive_mode.setEnabled(False)
         self.start.setEnabled(False)
         self.connect_button.setText("Отключить прибор")
-        self.device_info.setText(f"Открытие {port} · {self.baud.currentText()} 8N1…")
+        self.device_info.setText(f"Открытие {port} · {self.baud.currentText()} {self.serial_format()}…")
         self.worker.start()
 
     def device_opened(self):
@@ -680,6 +805,8 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.set_request_controls()
         self.port.setEnabled(True)
         self.baud.setEnabled(True)
+        for widget in (self.data_bits, self.parity, self.stop_bits):
+            widget.setEnabled(True)
         self.receive_mode.setEnabled(True)
         self.start.setEnabled(True)
         self.connect_button.setEnabled(True)
@@ -727,7 +854,15 @@ class TestbenchWindow(QtWidgets.QMainWindow):
                           receive_format=self.receive_mode.currentData(),
                           battery_vref_V=BATTERY_VREF_V, battery_r_top_kohm=BATTERY_R_TOP_KOHM,
                           battery_r_bottom_kohm=BATTERY_R_BOTTOM_KOHM,
-                          baud=int(self.baud.currentText()), serial_format="8N1", description=description)
+                          baud=int(self.baud.currentText()), serial_format=self.serial_format(),
+                          data_bits=self.data_bits.currentData(), parity=self.parity.currentData(),
+                          stop_bits=self.stop_bits.currentData(), description=description)
+            record.update(ch2_filter_size=self.alarm_filter.size, ch3_filter_size=self.battery_filter.size,
+                          ch2_filter_enabled=self.alarm_filter_check.isChecked(),
+                          ch3_filter_enabled=self.battery_filter_check.isChecked())
+            record["channel_filters"] = [dict(channel=index + 1, size=filter_.size,
+                                               enabled=check.isChecked())
+                                         for index, (filter_, check) in enumerate(zip(self.channel_filters, self.filter_checks))]
             try:
                 self.log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
                 self.log_file.flush()
@@ -904,10 +1039,11 @@ class TestbenchWindow(QtWidgets.QMainWindow):
     def add_working_sample(self, signal, trigger, state, stamp):
         self.times.append(max(0.0, stamp - self.session_start))
         self.values[0].append(signal)
+        self.feed_filters((signal,), stamp)
         self.working_thresholds.append(trigger)
         self.working_states.append(state)
         while self.times and self.times[0] < self.times[-1] - 60:
-            for buffer in (self.times, self.values[0], self.working_thresholds, self.working_states):
+            for buffer in (self.times, self.values[0], self.filtered_values[0], self.working_thresholds, self.working_states):
                 buffer.popleft()
         self.buffer_label.setText(f"v0.18 · {len(self.times)} измерений · обработанный сигнал UART")
         if not self.paused:
@@ -915,22 +1051,25 @@ class TestbenchWindow(QtWidgets.QMainWindow):
 
     def add_device_sample(self, value, stamp):
         self.times.append(max(0.0, stamp - self.session_start))
-        sample = value if isinstance(value, tuple) else (value,)
+        sample = value if isinstance(value, (tuple, list)) else (value,)
         for buffer, code in zip(self.values, sample):
             buffer.append(code)
-        if len(sample) == 3:
-            filtered = self.battery_filter.feed(sample[2], stamp)
-            self.filtered_battery_values.append(float("nan") if filtered is None else filtered)
+        self.feed_filters(sample, stamp)
         while self.times and self.times[0] < self.times[-1] - 60:
             self.times.popleft()
             for buffer in self.values[:len(sample)]:
                 buffer.popleft()
-            if len(sample) == 3:
-                self.filtered_battery_values.popleft()
-        kind = "A0–A2" if len(sample) == 3 else "уровень по команде 25"
+            for buffer in self.filtered_values[:len(sample)]:
+                buffer.popleft()
+        kind = f"{len(sample)} каналов" if len(sample) > 1 else "уровень по команде 25"
         self.buffer_label.setText(f"Прибор · {len(self.times)} измерений · {kind}")
         if not self.paused:
             self.update_plot()
+
+    def feed_filters(self, sample, stamp):
+        for filter_, buffer, code in zip(self.channel_filters, self.filtered_values, sample):
+            estimate = filter_.feed(code, stamp)
+            buffer.append(float("nan") if estimate is None else estimate)
 
     def toggle_thresholds(self, checked):
         if not checked:
@@ -1124,8 +1263,12 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.sample_index += count
         signals = [2048 + 23 * np.sin(2 * np.pi * 1.2 * times) + self.rng.normal(0, 5, count)]
         self.times.extend(times)
-        for buffer, signal in zip(self.values, signals):
-            buffer.extend(np.clip(np.rint(signal), 0, 4095).astype(int))
+        for index, (buffer, signal) in enumerate(zip(self.values, signals)):
+            codes = np.clip(np.rint(signal), 0, 4095).astype(int)
+            buffer.extend(codes)
+            for code, elapsed in zip(codes, times):
+                estimate = self.channel_filters[index].feed(code, self.session_start + elapsed)
+                self.filtered_values[index].append(float("nan") if estimate is None else estimate)
         if self.sample_index - self.demo_logged_sample >= self.rate // 5:
             self.demo_logged_sample = self.sample_index
             self.demo_exchange(int(self.values[0][-1]))
@@ -1158,34 +1301,65 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         if not self.times or self.paused:
             return
         times = np.asarray(self.times)
-        seconds = float(self.window_seconds.currentText())
+        seconds = self.window_seconds
         right = max(seconds, times[-1])
         left = right - seconds
         start = np.searchsorted(times, left)
         filtered = self.buffer_format == "adc_stream" and self.battery_filter_check.isChecked()
+        alarm_filtered = self.buffer_format == "adc_stream" and self.alarm_filter_check.isChecked()
         buffers = list(self.values)
-        if filtered:
-            buffers[2] = self.filtered_battery_values
+        for index, check in enumerate(self.filter_checks):
+            if check.isChecked() and check.isEnabled():
+                buffers[index] = self.filtered_values[index]
         for curve, buffer in zip(self.curves, buffers):
             if buffer:
                 curve.setData(times[start:], np.asarray(buffer)[start:])
         self.plot.setXRange(left, right, padding=0)
         if self.buffer_format == "adc_stream" and self.values[1]:
-            code = self.values[1][-1]
-            self.ch2_readout.setText(f"CH2: {code} код / {code * CH2_MV_PER_CODE:.1f} мВ")
+            code = buffers[1][-1]
+            if np.isfinite(code):
+                number = f"{code:.1f}" if alarm_filtered else f"{code:.0f}"
+                self.ch2_readout.setText(f"CH2: {number} код / {code * CH2_MV_PER_CODE:.1f} мВ"
+                                         + (f" · фильтр {self.alarm_filter.size}" if alarm_filtered else " · без фильтра"))
+            else:
+                self.ch2_readout.setText(f"CH2: набор {len(self.alarm_filter.samples)}/{self.alarm_filter.size}")
         if self.buffer_format == "adc_stream" and self.values[2]:
             code = buffers[2][-1]
             if np.isfinite(code):
-                suffix = " · фильтр" if filtered else " · без фильтра"
+                suffix = f" · фильтр {self.battery_filter.size}" if filtered else " · без фильтра"
                 self.battery_readout.setText(f"CH3: {code * BATTERY_V_PER_CODE:.3f} В" + suffix)
             else:
-                self.battery_readout.setText(f"CH3: набор {len(self.battery_filter.samples)}/256")
-        values = np.asarray(self.values[0])[start:]
+                self.battery_readout.setText(f"CH3: набор {len(self.battery_filter.samples)}/{self.battery_filter.size}")
+        values = np.asarray(buffers[0], dtype=float)[start:]
+        values = values[np.isfinite(values)]
         if len(values):
-            numbers = [f"{values[-1]:.0f}", f"{values.min():.0f}", f"{values.max():.0f}",
-                       f"{np.ptp(values):.0f}", f"{np.std(values):.2f}"]
+            precision = 1 if self.filter_checks[0].isChecked() else 0
+            numbers = [f"{values[-1]:.{precision}f}", f"{values.min():.{precision}f}", f"{values.max():.{precision}f}",
+                       f"{np.ptp(values):.{precision}f}", f"{np.std(values):.2f}"]
             for label, number in zip(self.stat_labels, numbers):
                 label.setText(("Сигнал " if self.buffer_format == "fw018" else "CH1 ") + number)
+        else:
+            for label in self.stat_labels:
+                label.setText("Сигнал —" if self.buffer_format == "fw018" else "CH1 —")
+        for label in self.stat_labels:
+            label.setToolTip(("Сигнал: " if self.buffer_format == "fw018" else "CH1: ")
+                             + (f"с фильтром, массив {self.channel_filters[0].size}" if self.filter_checks[0].isChecked()
+                                else "исходные отсчёты") + "; статистика по видимому окну")
+        if self.buffer_format == "adc_stream" and self.values[1]:
+            values = np.asarray(buffers[1], dtype=float)[start:]
+            values = values[np.isfinite(values)]
+            if len(values):
+                precision = 1 if alarm_filtered else 0
+                numbers = [f"{values[-1]:.{precision}f}", f"{values.min():.{precision}f}", f"{values.max():.{precision}f}",
+                           f"{np.ptp(values):.{precision}f}", f"{np.std(values):.2f}"]
+                for label, number in zip(self.stat_ch2_labels, numbers):
+                    label.setText("CH2 " + number)
+            else:
+                for label in self.stat_ch2_labels:
+                    label.setText("CH2 —")
+            for label in self.stat_ch2_labels:
+                label.setToolTip("CH2: " + (f"с фильтром, массив {self.alarm_filter.size}" if alarm_filtered else "исходные отсчёты")
+                                 + "; статистика по видимому окну, коды АЦП")
         if self.buffer_format == "adc_stream" and self.values[2]:
             voltage = np.asarray(buffers[2], dtype=float)[start:] * BATTERY_V_PER_CODE
             voltage = voltage[np.isfinite(voltage)]
@@ -1197,7 +1371,7 @@ class TestbenchWindow(QtWidgets.QMainWindow):
                 for label in self.stat_ch3_labels:
                     label.setText("CH3 — В")
             for label in self.stat_ch3_labels:
-                label.setToolTip("CH3: " + ("с фильтром, оценки по массивам 256 отсчётов" if filtered else "исходные отсчёты")
+                label.setToolTip("CH3: " + (f"с фильтром, массив {self.battery_filter.size}" if filtered else "исходные отсчёты")
                                  + "; статистика по видимому окну, В")
 
     def autoscale(self):
@@ -1211,8 +1385,9 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.last_uart_snapshot = None
         self.last_swd_snapshot = None
         self.last_noise = None
-        self.battery_filter.reset()
-        self.filtered_battery_values.clear()
+        for filter_, buffer in zip(self.channel_filters, self.filtered_values):
+            filter_.reset()
+            buffer.clear()
         self.threshold_times.clear()
         self.threshold_signals.clear()
         self.threshold_snapshot = None
@@ -1227,33 +1402,54 @@ class TestbenchWindow(QtWidgets.QMainWindow):
         self.session_start = time.monotonic()
         for label in self.stat_labels:
             label.setText("CH1 —")
+        for label in self.stat_ch2_labels:
+            label.setText("CH2 —")
         for label in self.stat_ch3_labels:
             label.setText("CH3 — В")
         self.buffer_label.setText("Буфер пуст")
         self.ch2_readout.setText("CH2: — код / — мВ")
         self.battery_readout.setText("CH3: — В")
-        self.plot.setXRange(0, float(self.window_seconds.currentText()), padding=0)
+        self.plot.setXRange(0, self.window_seconds, padding=0)
 
     def write_csv(self, path):
+        def formatted(value, scale=1):
+            return f"{value * scale:.6f}" if np.isfinite(value) else ""
+
         with Path(path).open("w", newline="", encoding="utf-8-sig") as stream:
             writer = csv.writer(stream, delimiter=";")
             if self.buffer_format == "fw018":
-                writer.writerow(["source", "time_s", "processed_signal", "trigger_threshold", "device_state"])
-                writer.writerows((self.source, f"{stamp:.6f}", signal, trigger, state)
-                                 for stamp, signal, trigger, state in zip(self.times, self.values[0],
-                                                                         self.working_thresholds, self.working_states))
+                writer.writerow(["source", "time_s", "processed_signal", "trigger_threshold", "device_state",
+                                 f"processed_signal_trimmed{self.channel_filters[0].size}"])
+                writer.writerows((self.source, f"{stamp:.6f}", signal, trigger, state, formatted(estimate))
+                                 for stamp, signal, trigger, state, estimate in zip(self.times, self.values[0],
+                                                                         self.working_thresholds, self.working_states,
+                                                                         self.filtered_values[0]))
                 return
             if self.buffer_format == "adc_stream":
-                writer.writerow(["source", "time_s", *ADC_CSV_COLUMNS,
-                                 "a2_trimmed256_code", "battery_trimmed256_V"])
-                writer.writerows((self.source, f"{stamp:.6f}", *sample,
-                                  f"{estimate:.4f}" if np.isfinite(estimate) else "",
-                                  f"{estimate * BATTERY_V_PER_CODE:.6f}" if np.isfinite(estimate) else "")
-                                 for stamp, *sample, estimate in zip(self.times, *self.values[:3], self.filtered_battery_values))
+                count = max((index + 1 for index, buffer in enumerate(self.values) if buffer), default=3)
+                columns = [ADC_CSV_COLUMNS[index] if index < 3 else f"ch{index + 1}_code" for index in range(count)]
+                header = ["source", "time_s", *columns]
+                for channel in range(count):
+                    prefix = f"a{channel}" if channel < 3 else f"ch{channel + 1}"
+                    size = self.channel_filters[channel].size
+                    header.append(f"{prefix}_trimmed{size}_code")
+                    if channel in (1, 2):
+                        header.append(f"alarm_trimmed{size}_mV" if channel == 1 else f"battery_trimmed{size}_V")
+                writer.writerow(header)
+                for row in zip(self.times, *self.values[:count], *self.filtered_values[:count]):
+                    output = [self.source, f"{row[0]:.6f}", *row[1:count + 1]]
+                    for channel, estimate in enumerate(row[count + 1:]):
+                        output.append(f"{estimate:.4f}" if np.isfinite(estimate) else "")
+                        if channel in (1, 2):
+                            output.append(formatted(estimate, CH2_MV_PER_CODE if channel == 1 else BATTERY_V_PER_CODE))
+                    writer.writerow(output)
                 return
-            writer.writerow(["source", "time_s", "ch1_level_code", "ch1_level_mV"])
-            writer.writerows((self.source, f"{stamp:.6f}", value, f"{value * 0.6105:.4f}")
-                             for stamp, value in zip(self.times, self.values[0]))
+            size = self.channel_filters[0].size
+            writer.writerow(["source", "time_s", "ch1_level_code", f"ch1_trimmed{size}_code",
+                             f"ch1_trimmed{size}_mV", "ch1_level_mV"])
+            writer.writerows((self.source, f"{stamp:.6f}", value, formatted(estimate), formatted(estimate, 0.6105),
+                              f"{value * 0.6105:.4f}")
+                             for stamp, value, estimate in zip(self.times, self.values[0], self.filtered_values[0]))
 
     def export_csv(self):
         if not self.times:

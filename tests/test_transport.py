@@ -1,5 +1,6 @@
 import time
 import unittest
+from unittest.mock import Mock, patch
 
 from qt_compat import QtCore
 from transport import SerialWorker
@@ -37,3 +38,15 @@ class TestTransport(unittest.TestCase):
         finally:
             worker.requestInterruption()
             self.assertTrue(worker.wait(1500))
+
+    def test_selected_serial_format_is_passed_to_driver(self):
+        worker = SerialWorker("loop://", 19200, bytesize=7, parity="E", stopbits=1.5)
+        connection = Mock()
+        with patch("transport.serial.serial_for_url", return_value=connection) as factory, \
+                patch.object(worker, "isInterruptionRequested", return_value=True):
+            worker.run()
+        self.assertEqual(factory.call_args.kwargs["bytesize"], 7)
+        self.assertEqual(factory.call_args.kwargs["parity"], "E")
+        self.assertEqual(factory.call_args.kwargs["stopbits"], 1.5)
+        connection.open.assert_called_once()
+        connection.close.assert_called_once()
